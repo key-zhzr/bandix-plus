@@ -19,17 +19,7 @@ set_linker_env() {
   export "$var_name=$linker_path"
 }
 
-set_linker_env "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER" "x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc"
 set_linker_env "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER" "aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER" "arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-gcc"
-set_linker_env "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABI_LINKER" "arm-linux-musleabi-cross/bin/arm-linux-musleabi-gcc"
-set_linker_env "CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_MUSLEABI_LINKER" "arm-linux-musleabi-cross/bin/arm-linux-musleabi-gcc"
-set_linker_env "CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABI_LINKER" "arm-linux-musleabi-cross/bin/arm-linux-musleabi-gcc"
-set_linker_env "CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_LINKER" "arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-gcc"
-set_linker_env "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER" "riscv64-linux-musl-cross/bin/riscv64-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_MUSL_LINKER" "powerpc64le-linux-musl-cross/bin/powerpc64le-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER" "mips-linux-musl-cross/bin/mips-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER" "mipsel-linux-musl-cross/bin/mipsel-linux-musl-gcc"
 
 # 定义版本号（从 Cargo.toml 获取或手动指定）
 VERSION=$(grep "^version" bandix-plus/Cargo.toml | cut -d '"' -f2)
