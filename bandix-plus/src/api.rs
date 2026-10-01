@@ -794,7 +794,6 @@ async fn query_hourly_buckets(
     state: &ApiState,
     ifindex: u32,
     mac: Option<&str>,
-    all_devices: bool,
     start_ms: u64,
     end_ms: u64,
 ) -> anyhow::Result<Vec<AggregatedBucket>> {
@@ -812,8 +811,6 @@ async fn query_hourly_buckets(
         };
         if let Some(mac) = mac {
             persistence.query_device_hourly(&iface_name, mac, start_ms, end_ms)?
-        } else if all_devices {
-            persistence.query_all_devices_hourly(&iface_name, start_ms, end_ms)?
         } else {
             persistence.query_iface_hourly(&iface_name, start_ms, end_ms)?
         }
@@ -821,33 +818,11 @@ async fn query_hourly_buckets(
         Vec::new()
     };
 
-    let live = if all_devices && mac.is_none() {
-        let macs: Vec<String> = {
-            let runtime = state.monitor_runtime.read().await;
-            runtime
-                .device_registry
-                .entries
-                .iter()
-                .filter_map(|((dev_ifindex, mac), _)| (*dev_ifindex == ifindex).then(|| mac_utils::to_string(mac)))
-                .collect()
-        };
-        let histogram = state.histogram.read().await;
-        let mut by_window: BTreeMap<(u64, u64), AggregatedBucket> = BTreeMap::new();
-        for mac in macs {
-            for b in histogram.query_aggregate(ifindex, Some(mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly) {
-                let key = (b.start_ts_ms, b.end_ts_ms);
-                let entry = by_window.entry(key).or_insert_with(|| empty_bucket(key.0, key.1));
-                accumulate_bucket(entry, &b);
-            }
-        }
-        by_window.into_values().collect()
-    } else {
-        state
-            .histogram
-            .read()
-            .await
-            .query_aggregate(ifindex, mac, start_ms, end_ms, AggregateBucket::Hourly)
-    };
+    let live = state
+        .histogram
+        .read()
+        .await
+        .query_aggregate(ifindex, mac, start_ms, end_ms, AggregateBucket::Hourly);
 
     if !state.traffic_enable_storage {
         return Ok(live);
@@ -864,7 +839,6 @@ async fn query_hourly_buckets(
     }
     Ok(by_window.into_values().collect())
 }
-
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -976,7 +950,7 @@ async fn aggregate(State(state): State<ApiState>, Query(q): Query<AggregateQuery
     let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
     let mac_filter = q.mac.as_deref().filter(|s| !s.trim().is_empty());
 
-    let hourly = match query_hourly_buckets(&state, ifindex, mac_filter, mac_filter.is_none(), start_ms, end_ms).await {
+    let hourly = match query_hourly_buckets(&state, ifindex, mac_filter, start_ms, end_ms).await {
         Ok(v) => v,
         Err(e) => {
             warn!("query histogram failed ifindex={} err={}", ifindex, e);
