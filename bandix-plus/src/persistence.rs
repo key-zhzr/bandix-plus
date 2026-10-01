@@ -280,8 +280,11 @@ impl PersistenceManager {
     pub fn save_current_hour_histogram(&self, histogram: &HistogramHistory, topology: &TopologySnapshot) -> anyhow::Result<()> {
         let watermark = self.current_hour_watermark_ms.load(Ordering::Relaxed);
         let exported = histogram.export_current_hour_state_since(watermark);
-        let now_ms = crate::utils::time_utils::now_millis();
-        let (current_hour_start, _) = crate::monitor::hourly_bucket_local(now_ms);
+        let current_hour_start = exported
+            .iface
+            .first()
+            .map(|x| x.hour_start_ts_ms)
+            .or_else(|| exported.device.first().map(|x| x.hour_start_ts_ms));
         let mut max_persisted_ts = watermark;
 
         for item in &exported.iface {
@@ -301,10 +304,12 @@ impl PersistenceManager {
             // Current-hour rows are a restart journal, not long-term history. Remove
             // stale hours once per periodic flush instead of deleting/reinserting the
             // whole active hour every minute.
-            tx.execute(
-                "DELETE FROM current_hour_points WHERE hour_start_ts_ms != ?1",
-                params![current_hour_start as i64],
-            )?;
+            if let Some(current_hour_start) = current_hour_start {
+                tx.execute(
+                    "DELETE FROM current_hour_points WHERE hour_start_ts_ms != ?1",
+                    params![current_hour_start as i64],
+                )?;
+            }
 
             for item in &exported.iface {
                 let Some(info) = topology.by_ifindex(item.ifindex) else {
@@ -518,6 +523,17 @@ impl PersistenceManager {
                 }
             }
         }
+
+        let recovered_watermark = self.with_conn(|conn| {
+            let max_ts: Option<i64> = conn.query_row(
+                "SELECT MAX(ts_ms) FROM current_hour_points WHERE hour_start_ts_ms = ?1",
+                params![expected_start as i64],
+                |row| row.get(0),
+            )?;
+            Ok(max_ts.unwrap_or(0).max(0) as u64)
+        })?;
+        self.current_hour_watermark_ms
+            .store(recovered_watermark, Ordering::Relaxed);
         Ok(())
     }
 
