@@ -66,6 +66,20 @@ impl MonitorRuntime {
         removed |= self.prev_device_bytes.len() != before;
         removed
     }
+
+    /// Bound the remembered-device registry using last-seen time.
+    pub fn prune_devices_older_than(&mut self, cutoff_ms: u64) -> usize {
+        let stale: Vec<(u32, [u8; 6])> = self
+            .device_registry
+            .entries
+            .iter()
+            .filter_map(|(key, dev)| (dev.last_seen_ms < cutoff_ms).then_some(*key))
+            .collect();
+        for (ifindex, mac) in &stale {
+            let _ = self.remove_device(*ifindex, *mac);
+        }
+        stale.len()
+    }
 }
 
 pub fn export_runtime_state(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> MonitorRuntimeState {
