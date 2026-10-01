@@ -1763,6 +1763,48 @@ mod memory_regression_tests {
     }
 
     #[test]
+    fn monitor_runtime_prunes_stale_device_state() {
+        let mut runtime = MonitorRuntime::default();
+        let mac_old = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01];
+        let mac_new = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02];
+
+        for (mac, last_seen_ms) in [(mac_old, 1_000_u64), (mac_new, 9_000_u64)] {
+            runtime.device_registry.entries.insert(
+                (7, mac),
+                KnownDevice {
+                    ifindex: 7,
+                    mac,
+                    ipv4: vec!["192.168.1.2".to_string()],
+                    ipv6: Vec::new(),
+                    hostname: "test".to_string(),
+                    logical_iface: "br-lan".to_string(),
+                    subnet: "192.168.1.0/24".to_string(),
+                    last_seen_ms,
+                },
+            );
+            runtime.cumulative_device.insert((7, mac), CounterQuad::default());
+            runtime.prev_device_bytes.insert(
+                DeviceTrafficKey {
+                    ifindex: 7,
+                    mac,
+                    ip_version: 4,
+                    direction: 0,
+                },
+                123,
+            );
+        }
+
+        assert_eq!(runtime.prune_devices_older_than(5_000), 1);
+        assert!(!runtime.device_registry.entries.contains_key(&(7, mac_old)));
+        assert!(!runtime.cumulative_device.contains_key(&(7, mac_old)));
+        assert!(runtime.prev_device_bytes.keys().all(|k| k.mac != mac_old));
+
+        assert!(runtime.device_registry.entries.contains_key(&(7, mac_new)));
+        assert!(runtime.cumulative_device.contains_key(&(7, mac_new)));
+        assert!(runtime.prev_device_bytes.keys().any(|k| k.mac == mac_new));
+    }
+
+    #[test]
     fn recent_history_reclaims_stale_offline_device_queue() {
         let mut history = TrafficHistory::new(3);
         history.ingest_snapshot(&device_snapshot(1_000, true, 1));
