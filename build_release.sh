@@ -42,30 +42,10 @@ mkdir -p $RELEASE_DIR
 
 # 构建目标平台列表
 DEFAULT_TARGETS=(
-  # x86_64 架构
-  "x86_64-unknown-linux-musl"
-  
-  # AArch64 (ARM64) 架构
   "aarch64-unknown-linux-musl"
-  
-  # ARM 32 位架构
-  "armv7-unknown-linux-musleabihf"
-  "armv7-unknown-linux-musleabi"
-  "armv5te-unknown-linux-musleabi"
-  "arm-unknown-linux-musleabi"
-  "arm-unknown-linux-musleabihf"
-  
-  # RISC-V 架构（新兴开源架构）
-  "riscv64gc-unknown-linux-musl"
-
-  # PowerPC 架构（部分高端路由器）
-  "powerpc64le-unknown-linux-musl"
 )
 
 MIPS_TARGETS=(
-  # MIPS 32 位架构（使用 nightly + build-std 构建）
-  "mips-unknown-linux-musl"
-  "mipsel-unknown-linux-musl"
 )
 
 print_linker_for_target() {
