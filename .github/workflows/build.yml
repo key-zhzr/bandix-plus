@@ -6,6 +6,9 @@ name: "build"
 permissions:
   contents: write
 on:
+  push:
+    branches:
+      - release/v0.1.6
   repository_dispatch:
   workflow_dispatch:
     inputs:
