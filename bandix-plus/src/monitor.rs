@@ -922,6 +922,18 @@ impl TrafficHistory {
 
     /// 将一次快照数据写入历史，供后续按接口或设备查询
     pub fn ingest_snapshot(&mut self, snapshot: &SnapshotData) {
+        // A device that goes offline no longer receives 1 Hz samples. Drop its
+        // last trend queue once the configured high-resolution window has
+        // elapsed, otherwise each historical MAC keeps a VecDeque forever.
+        let max_age_ms = (self.window_points as u64).saturating_mul(1_000);
+        let cutoff_ms = snapshot.timestamp_ms.saturating_sub(max_age_ms);
+        self.device_series.retain(|_, series| {
+            series
+                .back()
+                .map(|point| point.ts_ms >= cutoff_ms)
+                .unwrap_or(false)
+        });
+
         for iface in &snapshot.interfaces {
             let queue = self.iface_series.entry(iface.ifindex).or_default();
             queue.push_back(HistoryPoint {
@@ -1734,6 +1746,21 @@ mod memory_regression_tests {
                 neighbor_state: None,
             }],
         }
+    }
+
+    #[test]
+    fn recent_history_reclaims_stale_offline_device_queue() {
+        let mut history = TrafficHistory::new(3);
+        history.ingest_snapshot(&device_snapshot(1_000, true, 1));
+        assert_eq!(history.device_series.len(), 1);
+
+        // The queue remains available inside the 3-second trend window.
+        history.ingest_snapshot(&device_snapshot(3_000, false, 0));
+        assert_eq!(history.device_series.len(), 1);
+
+        // Once the last online sample ages out, the per-device VecDeque is freed.
+        history.ingest_snapshot(&device_snapshot(4_001, false, 0));
+        assert!(history.device_series.is_empty());
     }
 
     #[test]
