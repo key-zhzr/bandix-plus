@@ -12,6 +12,12 @@ use which::which;
 ///
 /// [bindeps]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html?highlight=feature#artifact-dependencies
 fn main() {
+    // Unit tests and host-side checks do not build the eBPF object. Keep the
+    // dependency crate checkable without requiring bpf-linker in that mode.
+    if std::env::var_os("AYA_BUILD_SKIP").is_some() {
+        return;
+    }
+
     let bpf_linker = which("bpf-linker").unwrap();
     println!("cargo:rerun-if-changed={}", bpf_linker.to_str().unwrap());
 }
