@@ -1702,3 +1702,96 @@ mod boundary_tests {
         let _ = now;
     }
 }
+
+#[cfg(test)]
+mod memory_regression_tests {
+    use super::*;
+    use chrono::{Local, TimeZone};
+
+    fn device_snapshot(ts_ms: u64, online: bool, up_bytes: u64) -> SnapshotData {
+        SnapshotData {
+            timestamp_ms: ts_ms,
+            interfaces: Vec::new(),
+            devices: vec![DeviceListItem {
+                ifindex: 7,
+                logical_iface: "br-lan".to_string(),
+                subnet: "192.168.1.0/24".to_string(),
+                ipv4: vec!["192.168.1.2".to_string()],
+                ipv6: Vec::new(),
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                hostname: "test".to_string(),
+                metrics: CounterQuad {
+                    up_v4_bytes: up_bytes,
+                    up_v4_bps: up_bytes.saturating_mul(8),
+                    ..CounterQuad::default()
+                },
+                cumulative: CounterQuad {
+                    up_v4_bytes: up_bytes,
+                    ..CounterQuad::default()
+                },
+                online,
+                last_seen_ms: ts_ms,
+                neighbor_state: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn recent_history_does_not_sample_offline_devices() {
+        let mut history = TrafficHistory::new(600);
+        history.ingest_snapshot(&device_snapshot(1_000, false, 0));
+        assert!(history.device_series.is_empty());
+    }
+
+    #[test]
+    fn offline_device_series_is_finalized_and_freed_at_hour_boundary() {
+        let first = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let next = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+
+        let mut history = HistogramHistory::new();
+        assert!(history
+            .ingest_snapshot_collect_completed(&device_snapshot(first, true, 10))
+            .is_empty());
+
+        let completed = history.ingest_snapshot_collect_completed(&device_snapshot(next, false, 0));
+        assert_eq!(completed.len(), 1);
+        match &completed[0] {
+            CompletedAggregate::Device { bucket, .. } => assert_eq!(bucket.up_v4_bytes, 10),
+            _ => panic!("expected device bucket"),
+        }
+        assert!(history.current_hour_device.is_empty());
+    }
+
+    #[test]
+    fn first_sample_of_hour_is_not_double_counted() {
+        let first = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let next = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+
+        let mut history = HistogramHistory::new();
+        history.ingest_snapshot_collect_completed(&device_snapshot(first, true, 123));
+        let completed = history.ingest_snapshot_collect_completed(&device_snapshot(next, true, 1));
+
+        let old = completed
+            .iter()
+            .find_map(|item| match item {
+                CompletedAggregate::Device { bucket, .. } if bucket.start_ts_ms < next => Some(bucket),
+                _ => None,
+            })
+            .expect("old hour should complete");
+        assert_eq!(old.up_v4_bytes, 123);
+    }
+
+    #[test]
+    fn persistence_mode_does_not_retain_completed_buckets_in_ram() {
+        let first = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let next = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+
+        let mut history = HistogramHistory::with_max_completed_hours(0);
+        history.ingest_snapshot_collect_completed(&device_snapshot(first, true, 10));
+        let completed = history.ingest_snapshot_collect_completed(&device_snapshot(next, true, 1));
+
+        assert_eq!(completed.len(), 1);
+        assert!(history.completed_device.is_empty());
+    }
+}
+
