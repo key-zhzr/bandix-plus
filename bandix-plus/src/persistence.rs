@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::{
-    export_runtime_state, import_runtime_state, promote_stale_points_to_bucket, AggregatedBucket, CurrentHourPointState,
+    export_runtime_state, import_runtime_state, promote_stale_points_to_bucket, AggregatedBucket, CounterQuad, CurrentHourPointState,
     HistogramHistory, MonitorRuntime, MonitorRuntimeState,
 };
 use crate::policy::{
@@ -13,6 +17,7 @@ use crate::policy::{
     PolicyRuntimeState,
 };
 use crate::topology::TopologySnapshot;
+use crate::utils::mac_utils;
 
 const POLICY_SCHEMA_VERSION: u32 = 1;
 const DEVICES_SCHEMA_VERSION: u32 = 1;
@@ -26,6 +31,7 @@ pub struct PersistenceManager {
     data_dir: PathBuf,
     db_path: PathBuf,
     conn: Mutex<Connection>,
+    current_hour_watermark_ms: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +58,7 @@ impl PersistenceManager {
             data_dir,
             db_path,
             conn: Mutex::new(conn),
+            current_hour_watermark_ms: AtomicU64::new(0),
         })
     }
 
@@ -271,10 +278,33 @@ impl PersistenceManager {
     }
 
     pub fn save_current_hour_histogram(&self, histogram: &HistogramHistory, topology: &TopologySnapshot) -> anyhow::Result<()> {
-        let exported = histogram.export_current_hour_state();
+        let watermark = self.current_hour_watermark_ms.load(Ordering::Relaxed);
+        let exported = histogram.export_current_hour_state_since(watermark);
+        let now_ms = crate::utils::time_utils::now_millis();
+        let (current_hour_start, _) = crate::monitor::hourly_bucket_local(now_ms);
+        let mut max_persisted_ts = watermark;
+
+        for item in &exported.iface {
+            for p in &item.points {
+                max_persisted_ts = max_persisted_ts.max(p.ts_ms);
+            }
+        }
+        for item in &exported.device {
+            for p in &item.points {
+                max_persisted_ts = max_persisted_ts.max(p.ts_ms);
+            }
+        }
+
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM current_hour_points", [])?;
+
+            // Current-hour rows are a restart journal, not long-term history. Remove
+            // stale hours once per periodic flush instead of deleting/reinserting the
+            // whole active hour every minute.
+            tx.execute(
+                "DELETE FROM current_hour_points WHERE hour_start_ts_ms != ?1",
+                params![current_hour_start as i64],
+            )?;
 
             for item in &exported.iface {
                 let Some(info) = topology.by_ifindex(item.ifindex) else {
@@ -282,7 +312,7 @@ impl PersistenceManager {
                 };
                 for p in &item.points {
                     tx.execute(
-                        "INSERT OR REPLACE INTO current_hour_points (
+                        "INSERT OR IGNORE INTO current_hour_points (
                             series_type, logical_iface, mac, hour_start_ts_ms, ts_ms,
                             up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
                             up_v4_bps, down_v4_bps, up_v6_bps, down_v6_bps
@@ -312,7 +342,7 @@ impl PersistenceManager {
                 };
                 for p in &item.points {
                     tx.execute(
-                        "INSERT OR REPLACE INTO current_hour_points (
+                        "INSERT OR IGNORE INTO current_hour_points (
                             series_type, logical_iface, mac, hour_start_ts_ms, ts_ms,
                             up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
                             up_v4_bps, down_v4_bps, up_v6_bps, down_v6_bps
@@ -338,7 +368,10 @@ impl PersistenceManager {
 
             tx.commit()?;
             Ok(())
-        })
+        })?;
+
+        self.current_hour_watermark_ms.store(max_persisted_ts, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn load_current_hour_histogram(
@@ -545,6 +578,189 @@ impl PersistenceManager {
         })
     }
 
+    pub fn query_iface_hourly(
+        &self,
+        iface_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<AggregatedBucket>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT start_ts_ms, end_ts_ms,
+                        up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+                        up_v4_bps_avg, up_v4_bps_max, up_v4_bps_min, up_v4_bps_p95,
+                        down_v4_bps_avg, down_v4_bps_max, down_v4_bps_min, down_v4_bps_p95,
+                        up_v6_bps_avg, up_v6_bps_max, up_v6_bps_min, up_v6_bps_p95,
+                        down_v6_bps_avg, down_v6_bps_max, down_v6_bps_min, down_v6_bps_p95
+                 FROM traffic_buckets
+                 WHERE series_type = ?1 AND logical_iface = ?2
+                   AND start_ts_ms <= ?3 AND end_ts_ms >= ?4
+                 ORDER BY start_ts_ms",
+            )?;
+            let rows = stmt.query_map(
+                params![SERIES_IFACE, iface_name, end_ms as i64, start_ms as i64],
+                |row| bucket_from_row(row, 0),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn query_device_hourly(
+        &self,
+        iface_name: &str,
+        mac: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<AggregatedBucket>> {
+        let mac_lower = mac.to_ascii_lowercase();
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT start_ts_ms, end_ts_ms,
+                        up_v4_bytes, down_v4_bytes, up_v6_bytes, down_v6_bytes,
+                        up_v4_bps_avg, up_v4_bps_max, up_v4_bps_min, up_v4_bps_p95,
+                        down_v4_bps_avg, down_v4_bps_max, down_v4_bps_min, down_v4_bps_p95,
+                        up_v6_bps_avg, up_v6_bps_max, up_v6_bps_min, up_v6_bps_p95,
+                        down_v6_bps_avg, down_v6_bps_max, down_v6_bps_min, down_v6_bps_p95
+                 FROM traffic_buckets
+                 WHERE series_type = ?1 AND logical_iface = ?2 AND mac = ?3
+                   AND start_ts_ms <= ?4 AND end_ts_ms >= ?5
+                 ORDER BY start_ts_ms",
+            )?;
+            let rows = stmt.query_map(
+                params![SERIES_DEVICE, iface_name, mac_lower, end_ms as i64, start_ms as i64],
+                |row| bucket_from_row(row, 0),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn query_all_devices_hourly(
+        &self,
+        iface_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<Vec<AggregatedBucket>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT start_ts_ms, end_ts_ms,
+                        SUM(up_v4_bytes), SUM(down_v4_bytes), SUM(up_v6_bytes), SUM(down_v6_bytes),
+                        SUM(up_v4_bps_avg), SUM(up_v4_bps_max), SUM(up_v4_bps_min), SUM(up_v4_bps_p95),
+                        SUM(down_v4_bps_avg), SUM(down_v4_bps_max), SUM(down_v4_bps_min), SUM(down_v4_bps_p95),
+                        SUM(up_v6_bps_avg), SUM(up_v6_bps_max), SUM(up_v6_bps_min), SUM(up_v6_bps_p95),
+                        SUM(down_v6_bps_avg), SUM(down_v6_bps_max), SUM(down_v6_bps_min), SUM(down_v6_bps_p95)
+                 FROM traffic_buckets
+                 WHERE series_type = ?1 AND logical_iface = ?2
+                   AND start_ts_ms <= ?3 AND end_ts_ms >= ?4
+                 GROUP BY start_ts_ms, end_ts_ms
+                 ORDER BY start_ts_ms",
+            )?;
+            let rows = stmt.query_map(
+                params![SERIES_DEVICE, iface_name, end_ms as i64, start_ms as i64],
+                |row| bucket_from_row(row, 0),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn query_iface_total(&self, iface_name: &str, start_ms: u64, end_ms: u64) -> anyhow::Result<CounterQuad> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(SUM(up_v4_bytes), 0), COALESCE(SUM(down_v4_bytes), 0),
+                        COALESCE(SUM(up_v6_bytes), 0), COALESCE(SUM(down_v6_bytes), 0)
+                 FROM traffic_buckets
+                 WHERE series_type = ?1 AND logical_iface = ?2
+                   AND start_ts_ms <= ?3 AND end_ts_ms >= ?4",
+                params![SERIES_IFACE, iface_name, end_ms as i64, start_ms as i64],
+                |row| {
+                    Ok(CounterQuad {
+                        up_v4_bytes: row.get::<_, i64>(0)? as u64,
+                        down_v4_bytes: row.get::<_, i64>(1)? as u64,
+                        up_v6_bytes: row.get::<_, i64>(2)? as u64,
+                        down_v6_bytes: row.get::<_, i64>(3)? as u64,
+                        ..CounterQuad::default()
+                    })
+                },
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn query_device_totals(
+        &self,
+        iface_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> anyhow::Result<HashMap<String, CounterQuad>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT mac,
+                        COALESCE(SUM(up_v4_bytes), 0), COALESCE(SUM(down_v4_bytes), 0),
+                        COALESCE(SUM(up_v6_bytes), 0), COALESCE(SUM(down_v6_bytes), 0)
+                 FROM traffic_buckets
+                 WHERE series_type = ?1 AND logical_iface = ?2
+                   AND start_ts_ms <= ?3 AND end_ts_ms >= ?4
+                 GROUP BY mac",
+            )?;
+            let rows = stmt.query_map(
+                params![SERIES_DEVICE, iface_name, end_ms as i64, start_ms as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CounterQuad {
+                            up_v4_bytes: row.get::<_, i64>(1)? as u64,
+                            down_v4_bytes: row.get::<_, i64>(2)? as u64,
+                            up_v6_bytes: row.get::<_, i64>(3)? as u64,
+                            down_v6_bytes: row.get::<_, i64>(4)? as u64,
+                            ..CounterQuad::default()
+                        },
+                    ))
+                },
+            )?;
+            let mut out = HashMap::new();
+            for row in rows {
+                let (mac, total) = row?;
+                out.insert(mac, total);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn load_cumulative(
+        &self,
+        topology: &TopologySnapshot,
+    ) -> anyhow::Result<(HashMap<u32, CounterQuad>, HashMap<(u32, [u8; 6]), CounterQuad>)> {
+        let mut iface_totals = HashMap::new();
+        let mut device_totals = HashMap::new();
+
+        for iface in topology.interfaces() {
+            let total = self.query_iface_total(&iface.name, 0, u64::MAX)?;
+            if total.up_v4_bytes != 0 || total.down_v4_bytes != 0 || total.up_v6_bytes != 0 || total.down_v6_bytes != 0 {
+                iface_totals.insert(iface.ifindex, total);
+            }
+
+            for (mac, total) in self.query_device_totals(&iface.name, 0, u64::MAX)? {
+                let Ok(parsed) = mac_utils::from_str(&mac) else {
+                    continue;
+                };
+                device_totals.insert((iface.ifindex, parsed), total);
+            }
+        }
+
+        Ok((iface_totals, device_totals))
+    }
+
     pub fn load_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {
         let rows: Vec<(String, String, String, AggregatedBucket)> = self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -665,6 +881,33 @@ impl PersistenceManager {
         )?;
         Ok(())
     }
+}
+
+fn bucket_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<AggregatedBucket> {
+    Ok(AggregatedBucket {
+        start_ts_ms: row.get::<_, i64>(offset)? as u64,
+        end_ts_ms: row.get::<_, i64>(offset + 1)? as u64,
+        up_v4_bytes: row.get::<_, i64>(offset + 2)? as u64,
+        down_v4_bytes: row.get::<_, i64>(offset + 3)? as u64,
+        up_v6_bytes: row.get::<_, i64>(offset + 4)? as u64,
+        down_v6_bytes: row.get::<_, i64>(offset + 5)? as u64,
+        up_v4_bps_avg: row.get::<_, i64>(offset + 6)? as u64,
+        up_v4_bps_max: row.get::<_, i64>(offset + 7)? as u64,
+        up_v4_bps_min: row.get::<_, i64>(offset + 8)? as u64,
+        up_v4_bps_p95: row.get::<_, i64>(offset + 9)? as u64,
+        down_v4_bps_avg: row.get::<_, i64>(offset + 10)? as u64,
+        down_v4_bps_max: row.get::<_, i64>(offset + 11)? as u64,
+        down_v4_bps_min: row.get::<_, i64>(offset + 12)? as u64,
+        down_v4_bps_p95: row.get::<_, i64>(offset + 13)? as u64,
+        up_v6_bps_avg: row.get::<_, i64>(offset + 14)? as u64,
+        up_v6_bps_max: row.get::<_, i64>(offset + 15)? as u64,
+        up_v6_bps_min: row.get::<_, i64>(offset + 16)? as u64,
+        up_v6_bps_p95: row.get::<_, i64>(offset + 17)? as u64,
+        down_v6_bps_avg: row.get::<_, i64>(offset + 18)? as u64,
+        down_v6_bps_max: row.get::<_, i64>(offset + 19)? as u64,
+        down_v6_bps_min: row.get::<_, i64>(offset + 20)? as u64,
+        down_v6_bps_p95: row.get::<_, i64>(offset + 21)? as u64,
+    })
 }
 
 fn normalize_mac_hex(mac: &str) -> Option<String> {
