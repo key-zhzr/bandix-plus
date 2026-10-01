@@ -31,14 +31,7 @@ echo "=========================================="
 # 定义需要安装的工具链
 # 格式: "工具链名称:链接器名称"
 declare -A TOOLCHAINS=(
-    ["arm-linux-musleabihf-cross"]="arm-linux-musleabihf-gcc"
-    ["arm-linux-musleabi-cross"]="arm-linux-musleabi-gcc"
     ["aarch64-linux-musl-cross"]="aarch64-linux-musl-gcc"
-    ["riscv64-linux-musl-cross"]="riscv64-linux-musl-gcc"
-    ["powerpc64le-linux-musl-cross"]="powerpc64le-linux-musl-gcc"
-    ["mips-linux-musl-cross"]="mips-linux-musl-gcc"
-    ["mipsel-linux-musl-cross"]="mipsel-linux-musl-gcc"
-    ["x86_64-linux-musl-cross"]="x86_64-linux-musl-gcc"
 )
 
 # 选择包管理器
@@ -110,15 +103,7 @@ echo "安装 bpf-linker (v0.10.2) ..." # bpf-linker 版本需要和 LLVM 版本�
 cargo install bpf-linker@0.10.2
 
 RUST_TARGETS=(
-    "x86_64-unknown-linux-musl"
     "aarch64-unknown-linux-musl"
-    "armv7-unknown-linux-musleabihf"
-    "armv7-unknown-linux-musleabi"
-    "armv5te-unknown-linux-musleabi"
-    "arm-unknown-linux-musleabi"
-    "arm-unknown-linux-musleabihf"
-    "riscv64gc-unknown-linux-musl"
-    "powerpc64le-unknown-linux-musl"
 )
 
 echo "安装/更新 Rust 交叉目标..."
