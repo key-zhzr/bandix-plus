@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -13,8 +13,8 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::monitor::{
-    AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, KnownDevice, MonitorRuntime,
-    SnapshotData, TrafficHistory,
+    merge_hourly_to_daily, AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType,
+    KnownDevice, MonitorRuntime, SnapshotData, TrafficHistory,
 };
 use crate::persistence::PersistenceManager;
 use crate::policy::{
@@ -182,7 +182,6 @@ async fn usage_ranking(
     };
 
     let tt = parse_traffic_type(q.traffic_type.as_deref());
-
     let now_ms = Local::now().timestamp_millis() as u64;
     let default_start = (Local::now() - ChronoDuration::days(365)).timestamp_millis() as u64;
     let start_ms = q.start_ms.unwrap_or(default_start);
@@ -190,7 +189,6 @@ async fn usage_ranking(
     if end_ms < start_ms {
         return Err(StatusCode::BAD_REQUEST);
     }
-
     let limit = q.limit.filter(|v| *v > 0);
 
     let ifindex = match resolve_query_iface_to_ifindex(&state, Some(iface.clone())).await {
@@ -198,43 +196,63 @@ async fn usage_ranking(
         Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
 
+    let persisted = if state.traffic_enable_storage {
+        let Some(persistence) = state.persistence.as_ref() else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        match persistence.query_device_totals(&iface, start_ms, end_ms) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("query persisted ranking totals failed iface={} err={}", iface, e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    } else {
+        None
+    };
+
     let runtime = state.monitor_runtime.read().await;
     let histogram = state.histogram.read().await;
+    let mut items = Vec::new();
 
-    let mut items: Vec<UsageRankingItem> = runtime
-        .device_registry
-        .entries
-        .iter()
-        .filter_map(|((dev_ifindex, mac), dev)| {
-            if *dev_ifindex != ifindex {
-                return None;
-            }
+    for ((dev_ifindex, mac), dev) in &runtime.device_registry.entries {
+        if *dev_ifindex != ifindex {
+            continue;
+        }
+        let mac_s = mac_utils::to_string(mac);
+        let mut total = persisted
+            .as_ref()
+            .and_then(|m| m.get(&mac_s.to_ascii_lowercase()))
+            .copied()
+            .unwrap_or_default();
 
-            let mac_s = mac_utils::to_string(mac);
-            let buckets = histogram.query_aggregate(ifindex, Some(mac_s.as_str()), start_ms, end_ms, AggregateBucket::Daily);
-            let mut up: u64 = 0;
-            let mut down: u64 = 0;
-            for b in buckets.into_iter().map(|b| b.with_traffic_type(tt)) {
-                up = up.saturating_add(b.up_v4_bytes.saturating_add(b.up_v6_bytes));
-                down = down.saturating_add(b.down_v4_bytes.saturating_add(b.down_v6_bytes));
-            }
-            let total = up.saturating_add(down);
-            if total == 0 {
-                return None;
-            }
+        let live = histogram.query_aggregate(ifindex, Some(mac_s.as_str()), start_ms, end_ms, AggregateBucket::Hourly);
+        add_counter_bytes(&mut total, &cumulative_from_buckets(&live));
 
-            Some(UsageRankingItem {
-                iface: iface.clone(),
-                mac: mac_s,
-                hostname: dev.hostname.clone(),
-                ipv4: dev.ipv4.clone(),
-                ipv6: dev.ipv6.clone(),
-                up_bytes: up,
-                down_bytes: down,
-                total_bytes: total,
-            })
-        })
-        .collect();
+        let (up, down) = match tt {
+            HistoryTrafficType::All => (
+                total.up_v4_bytes.saturating_add(total.up_v6_bytes),
+                total.down_v4_bytes.saturating_add(total.down_v6_bytes),
+            ),
+            HistoryTrafficType::Ipv4 => (total.up_v4_bytes, total.down_v4_bytes),
+            HistoryTrafficType::Ipv6 => (total.up_v6_bytes, total.down_v6_bytes),
+        };
+        let total_bytes = up.saturating_add(down);
+        if total_bytes == 0 {
+            continue;
+        }
+
+        items.push(UsageRankingItem {
+            iface: iface.clone(),
+            mac: mac_s,
+            hostname: dev.hostname.clone(),
+            ipv4: dev.ipv4.clone(),
+            ipv6: dev.ipv6.clone(),
+            up_bytes: up,
+            down_bytes: down,
+            total_bytes,
+        });
+    }
 
     items.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes).then(a.mac.cmp(&b.mac)));
     if let Some(limit) = limit {
@@ -347,10 +365,37 @@ async fn overview(
     let mut data = state.snapshot.read().await.interfaces.clone();
     if let Some(scope) = period {
         let (start_ms, end_ms) = period_range_ms(scope, now_millis());
-        let histogram = state.histogram.read().await;
-        for item in &mut data {
-            let buckets = histogram.query_aggregate(item.ifindex, None, start_ms, end_ms, AggregateBucket::Hourly);
-            item.cumulative = cumulative_from_buckets(&buckets);
+        if state.traffic_enable_storage {
+            let Some(persistence) = state.persistence.as_ref() else {
+                return Json(ApiEnvelope {
+                    ok: false,
+                    data: Vec::new(),
+                    error: Some("traffic persistence is enabled but unavailable".to_string()),
+                });
+            };
+            let histogram = state.histogram.read().await;
+            for item in &mut data {
+                let mut total = match persistence.query_iface_total(&item.ifname, start_ms, end_ms) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("query persisted iface total failed iface={} err={}", item.ifname, e);
+                        return Json(ApiEnvelope {
+                            ok: false,
+                            data: Vec::new(),
+                            error: Some(format!("query persisted traffic failed: {e}")),
+                        });
+                    }
+                };
+                let live = histogram.query_aggregate(item.ifindex, None, start_ms, end_ms, AggregateBucket::Hourly);
+                add_counter_bytes(&mut total, &cumulative_from_buckets(&live));
+                item.cumulative = total;
+            }
+        } else {
+            let histogram = state.histogram.read().await;
+            for item in &mut data {
+                let buckets = histogram.query_aggregate(item.ifindex, None, start_ms, end_ms, AggregateBucket::Hourly);
+                item.cumulative = cumulative_from_buckets(&buckets);
+            }
         }
     }
     Json(ApiEnvelope {
@@ -383,12 +428,57 @@ async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -
             true
         })
         .collect();
+
     if let Some(scope) = period {
         let (start_ms, end_ms) = period_range_ms(scope, now_millis());
-        let histogram = state.histogram.read().await;
-        for item in &mut filtered {
-            let buckets = histogram.query_aggregate(item.ifindex, Some(item.mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly);
-            item.cumulative = cumulative_from_buckets(&buckets);
+        if state.traffic_enable_storage {
+            let Some(persistence) = state.persistence.as_ref() else {
+                return Json(ApiEnvelope {
+                    ok: false,
+                    data: Vec::new(),
+                    error: Some("traffic persistence is enabled but unavailable".to_string()),
+                });
+            };
+
+            let mut persisted: HashMap<String, HashMap<String, crate::monitor::CounterQuad>> = HashMap::new();
+            let mut iface_names: Vec<String> = filtered.iter().map(|d| d.logical_iface.clone()).collect();
+            iface_names.sort();
+            iface_names.dedup();
+            for iface in iface_names {
+                match persistence.query_device_totals(&iface, start_ms, end_ms) {
+                    Ok(v) => {
+                        persisted.insert(iface, v);
+                    }
+                    Err(e) => {
+                        warn!("query persisted device totals failed iface={} err={}", iface, e);
+                        return Json(ApiEnvelope {
+                            ok: false,
+                            data: Vec::new(),
+                            error: Some(format!("query persisted traffic failed: {e}")),
+                        });
+                    }
+                }
+            }
+
+            let histogram = state.histogram.read().await;
+            for item in &mut filtered {
+                let mut total = persisted
+                    .get(&item.logical_iface)
+                    .and_then(|m| m.get(&item.mac.to_ascii_lowercase()))
+                    .copied()
+                    .unwrap_or_default();
+                let live =
+                    histogram.query_aggregate(item.ifindex, Some(item.mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly);
+                add_counter_bytes(&mut total, &cumulative_from_buckets(&live));
+                item.cumulative = total;
+            }
+        } else {
+            let histogram = state.histogram.read().await;
+            for item in &mut filtered {
+                let buckets =
+                    histogram.query_aggregate(item.ifindex, Some(item.mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly);
+                item.cumulative = cumulative_from_buckets(&buckets);
+            }
         }
     }
     Json(ApiEnvelope {
@@ -693,6 +783,89 @@ fn cumulative_from_buckets(buckets: &[AggregatedBucket]) -> crate::monitor::Coun
     out
 }
 
+fn add_counter_bytes(dst: &mut crate::monitor::CounterQuad, src: &crate::monitor::CounterQuad) {
+    dst.up_v4_bytes = dst.up_v4_bytes.saturating_add(src.up_v4_bytes);
+    dst.down_v4_bytes = dst.down_v4_bytes.saturating_add(src.down_v4_bytes);
+    dst.up_v6_bytes = dst.up_v6_bytes.saturating_add(src.up_v6_bytes);
+    dst.down_v6_bytes = dst.down_v6_bytes.saturating_add(src.down_v6_bytes);
+}
+
+async fn query_hourly_buckets(
+    state: &ApiState,
+    ifindex: u32,
+    mac: Option<&str>,
+    all_devices: bool,
+    start_ms: u64,
+    end_ms: u64,
+) -> anyhow::Result<Vec<AggregatedBucket>> {
+    let persisted = if state.traffic_enable_storage {
+        let persistence = state
+            .persistence
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("persistence manager unavailable"))?;
+        let iface_name = {
+            let topology = state.topology.read().await;
+            topology
+                .by_ifindex(ifindex)
+                .map(|x| x.name.clone())
+                .ok_or_else(|| anyhow::anyhow!("unknown ifindex {ifindex}"))?
+        };
+        if let Some(mac) = mac {
+            persistence.query_device_hourly(&iface_name, mac, start_ms, end_ms)?
+        } else if all_devices {
+            persistence.query_all_devices_hourly(&iface_name, start_ms, end_ms)?
+        } else {
+            persistence.query_iface_hourly(&iface_name, start_ms, end_ms)?
+        }
+    } else {
+        Vec::new()
+    };
+
+    let live = if all_devices && mac.is_none() {
+        let macs: Vec<String> = {
+            let runtime = state.monitor_runtime.read().await;
+            runtime
+                .device_registry
+                .entries
+                .iter()
+                .filter_map(|((dev_ifindex, mac), _)| (*dev_ifindex == ifindex).then(|| mac_utils::to_string(mac)))
+                .collect()
+        };
+        let histogram = state.histogram.read().await;
+        let mut by_window: BTreeMap<(u64, u64), AggregatedBucket> = BTreeMap::new();
+        for mac in macs {
+            for b in histogram.query_aggregate(ifindex, Some(mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly) {
+                let key = (b.start_ts_ms, b.end_ts_ms);
+                let entry = by_window.entry(key).or_insert_with(|| empty_bucket(key.0, key.1));
+                accumulate_bucket(entry, &b);
+            }
+        }
+        by_window.into_values().collect()
+    } else {
+        state
+            .histogram
+            .read()
+            .await
+            .query_aggregate(ifindex, mac, start_ms, end_ms, AggregateBucket::Hourly)
+    };
+
+    if !state.traffic_enable_storage {
+        return Ok(live);
+    }
+
+    // Completed buckets come from SQLite and the active hour comes from RAM.
+    // In the rare case of overlap during an hour rollover, prefer the live bucket.
+    let mut by_window: BTreeMap<(u64, u64), AggregatedBucket> = BTreeMap::new();
+    for b in persisted {
+        by_window.insert((b.start_ts_ms, b.end_ts_ms), b);
+    }
+    for b in live {
+        by_window.insert((b.start_ts_ms, b.end_ts_ms), b);
+    }
+    Ok(by_window.into_values().collect())
+}
+
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -784,14 +957,18 @@ async fn aggregate(State(state): State<ApiState>, Query(q): Query<AggregateQuery
             });
         }
     };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = now_millis();
     let default_end = now_ms;
     let default_start = now_ms.saturating_sub(24 * 3600 * 1000);
     let start_ms = q.start_ms.unwrap_or(default_start);
     let end_ms = q.end_ms.unwrap_or(default_end);
+    if end_ms < start_ms {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: Vec::new(),
+            error: Some("end_ms must be >= start_ms".to_string()),
+        });
+    }
     let bucket = match q.bucket.as_deref().unwrap_or("hourly").to_ascii_lowercase().as_str() {
         "daily" => AggregateBucket::Daily,
         _ => AggregateBucket::Hourly,
@@ -799,37 +976,25 @@ async fn aggregate(State(state): State<ApiState>, Query(q): Query<AggregateQuery
     let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
     let mac_filter = q.mac.as_deref().filter(|s| !s.trim().is_empty());
 
-    let result: Vec<AggregatedBucket> = if let Some(mac) = mac_filter {
-        let histogram = state.histogram.read().await;
-        histogram
-            .query_aggregate(ifindex, Some(mac), start_ms, end_ms, bucket)
-            .into_iter()
-            .map(|b| b.with_traffic_type(traffic_type))
-            .collect()
-    } else {
-        // "all devices" 口径：按设备维度聚合后再求和，避免包含无法归属到设备的流量。
-        let runtime = state.monitor_runtime.read().await;
-        let mut macs = Vec::new();
-        for ((dev_ifindex, mac), _dev) in &runtime.device_registry.entries {
-            if *dev_ifindex == ifindex {
-                macs.push(mac_utils::to_string(mac));
-            }
+    let hourly = match query_hourly_buckets(&state, ifindex, mac_filter, mac_filter.is_none(), start_ms, end_ms).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("query histogram failed ifindex={} err={}", ifindex, e);
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some(format!("query traffic history failed: {e}")),
+            });
         }
-        drop(runtime);
-
-        let histogram = state.histogram.read().await;
-        let mut by_window: BTreeMap<(u64, u64), AggregatedBucket> = BTreeMap::new();
-        for mac in macs {
-            let buckets = histogram.query_aggregate(ifindex, Some(mac.as_str()), start_ms, end_ms, bucket);
-            for b in buckets {
-                let key = (b.start_ts_ms, b.end_ts_ms);
-                let entry = by_window.entry(key).or_insert_with(|| empty_bucket(key.0, key.1));
-                accumulate_bucket(entry, &b);
-            }
-        }
-
-        by_window.into_values().map(|b| b.with_traffic_type(traffic_type)).collect()
     };
+    let result = match bucket {
+        AggregateBucket::Hourly => hourly,
+        AggregateBucket::Daily => merge_hourly_to_daily(&hourly),
+    }
+    .into_iter()
+    .map(|b| b.with_traffic_type(traffic_type))
+    .collect();
+
     Json(ApiEnvelope {
         ok: true,
         data: result,
