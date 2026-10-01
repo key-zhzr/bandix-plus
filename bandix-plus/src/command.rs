@@ -1,6 +1,8 @@
 use crate::api::{start_server, ApiState};
 use crate::ebpf::shared::load_ebpf_programs;
-use crate::monitor::{build_recovered_snapshot, collect_snapshot, CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory};
+use crate::monitor::{
+    build_recovered_snapshot, collect_snapshot, CompletedAggregate, CounterQuad, HistogramHistory, MonitorRuntime, TrafficHistory,
+};
 use crate::options::{Options, TcBackend, TcOrder};
 use crate::persistence::PersistenceManager;
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy_runtime_summary, parse_policy};
@@ -105,21 +107,40 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let history_points = ((options.history_window_minutes as u64) * 60).max(1) as usize;
     let history = Arc::new(RwLock::new(TrafficHistory::new(history_points)));
 
-    let mut histogram_raw = HistogramHistory::new();
-    if options.traffic_enable_storage {
-        if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
-            log::warn!("load traffic histogram state failed: {}", e);
-        }
-    }
+    // With persistent storage enabled, SQLite is the source of truth for
+    // completed hourly buckets. Keep only the active hour in RAM.
+    let mut histogram_raw = if options.traffic_enable_storage {
+        HistogramHistory::with_max_completed_hours(0)
+    } else {
+        HistogramHistory::new()
+    };
     let recovery_now_ms = time_utils::now_millis();
     if options.traffic_enable_storage {
         if let Err(e) = persistence.load_current_hour_histogram(&topology, &mut histogram_raw, recovery_now_ms) {
             log::warn!("load current-hour histogram state failed: {}", e);
         }
     }
-    let (ring_iface_cumulative, ring_device_cumulative) = histogram_raw.cumulative_from_all();
-    monitor_runtime.cumulative_iface = ring_iface_cumulative;
-    monitor_runtime.cumulative_device = ring_device_cumulative;
+
+    let (mut iface_cumulative, mut device_cumulative) = if options.traffic_enable_storage {
+        match persistence.load_cumulative(&topology) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("load persisted cumulative traffic failed: {}", e);
+                (Default::default(), Default::default())
+            }
+        }
+    } else {
+        (Default::default(), Default::default())
+    };
+    let (current_iface, current_device) = histogram_raw.cumulative_from_all();
+    for (ifindex, current) in current_iface {
+        add_counter_bytes(iface_cumulative.entry(ifindex).or_default(), &current);
+    }
+    for (key, current) in current_device {
+        add_counter_bytes(device_cumulative.entry(key).or_default(), &current);
+    }
+    monitor_runtime.cumulative_iface = iface_cumulative;
+    monitor_runtime.cumulative_device = device_cumulative;
 
     let monitor_runtime = Arc::new(RwLock::new(monitor_runtime));
     let recovered_snapshot = {
@@ -210,12 +231,12 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                             match item {
                                 CompletedAggregate::Iface { iface, bucket } => {
                                     if let Err(e) = collector_persistence.append_iface_bucket(&iface, &bucket) {
-                                        log::error!("persist iface ring failed iface={} err={}", iface, e);
+                                        log::error!("persist iface bucket failed iface={} err={}", iface, e);
                                     }
                                 }
                                 CompletedAggregate::Device { iface, mac, bucket } => {
                                     if let Err(e) = collector_persistence.append_device_bucket(&iface, &mac, &bucket) {
-                                        log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
+                                        log::error!("persist device bucket failed iface={} mac={} err={}", iface, mac, e);
                                     }
                                 }
                             }
@@ -227,6 +248,9 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                     }
 
                     if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
+                        // Track attempts rather than only successes. Otherwise a single
+                        // persistence error makes the 1 Hz collector retry heavy I/O every second.
+                        last_periodic_persist_ms = data.timestamp_ms;
                         let topo = collector_topology.read().await.clone();
                         let runtime_saved = {
                             let runtime_guard = collector_monitor_runtime.read().await;
@@ -252,14 +276,15 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                             true
                         };
 
-                        if runtime_saved && histogram_saved {
-                            last_periodic_persist_ms = data.timestamp_ms;
+                        if !(runtime_saved && histogram_saved) {
+                            log::warn!("periodic persistence incomplete; next retry in about 60s");
                         }
                     }
 
                     if collector_traffic_enable_storage
                         && data.timestamp_ms.saturating_sub(last_prune_ms) >= PRUNE_INTERVAL_MS
                     {
+                        last_prune_ms = data.timestamp_ms;
                         match collector_persistence.prune_traffic_buckets(
                             collector_traffic_retention_days,
                             data.timestamp_ms,
@@ -271,7 +296,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                                         log::warn!("incremental vacuum failed: {}", e);
                                     }
                                 }
-                                last_prune_ms = data.timestamp_ms;
                             }
                             Err(e) => log::warn!("hourly prune traffic buckets failed: {}", e),
                         }
@@ -288,6 +312,13 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     start_server(&bind_addr, api_state).await?;
 
     Ok(())
+}
+
+fn add_counter_bytes(dst: &mut CounterQuad, src: &CounterQuad) {
+    dst.up_v4_bytes = dst.up_v4_bytes.saturating_add(src.up_v4_bytes);
+    dst.down_v4_bytes = dst.down_v4_bytes.saturating_add(src.down_v4_bytes);
+    dst.up_v6_bytes = dst.up_v6_bytes.saturating_add(src.up_v6_bytes);
+    dst.down_v6_bytes = dst.down_v6_bytes.saturating_add(src.down_v6_bytes);
 }
 
 /// 校验 --iface 和 TC 相关参数。
