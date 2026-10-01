@@ -600,15 +600,10 @@ impl HistogramHistory {
 
     fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
-        let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
-            (
-                hour_start,
-                vec![CurrentHourPointState {
-                    ts_ms,
-                    metrics: *metrics,
-                }],
-            )
-        });
+        let entry = self
+            .current_hour_iface
+            .entry(ifindex)
+            .or_insert_with(|| (hour_start, Vec::new()));
         let (cur_hour, points) = entry;
         let (cur_start, _) = hourly_bucket_local(*cur_hour);
         let (new_start, _) = hourly_bucket_local(ts_ms);
@@ -637,15 +632,10 @@ impl HistogramHistory {
 
     fn ingest_device(&mut self, key: &DeviceSeriesKey, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
-        let entry = self.current_hour_device.entry(key.clone()).or_insert_with(|| {
-            (
-                hour_start,
-                vec![CurrentHourPointState {
-                    ts_ms,
-                    metrics: *metrics,
-                }],
-            )
-        });
+        let entry = self
+            .current_hour_device
+            .entry(key.clone())
+            .or_insert_with(|| (hour_start, Vec::new()));
         let (cur_hour, points) = entry;
         let (cur_start, _) = hourly_bucket_local(*cur_hour);
         let (new_start, _) = hourly_bucket_local(ts_ms);
