@@ -101,6 +101,15 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     if let Err(e) = persistence.load_monitor_runtime(&mut monitor_runtime, &topology) {
         log::warn!("load devices state failed: {}", e);
     }
+    if options.traffic_retention_days > 0 {
+        let max_age_ms = (options.traffic_retention_days as u64)
+            .saturating_mul(24 * 60 * 60 * 1000);
+        let cutoff_ms = time_utils::now_millis().saturating_sub(max_age_ms);
+        let pruned = monitor_runtime.prune_devices_older_than(cutoff_ms);
+        if pruned > 0 {
+            log::info!("pruned expired remembered devices count={pruned}");
+        }
+    }
     log::info!("devices.loaded known_devices={}", monitor_runtime.device_registry.entries.len());
 
     let collect_interval_secs = 1_u64;
@@ -281,23 +290,37 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                         }
                     }
 
-                    if collector_traffic_enable_storage
-                        && data.timestamp_ms.saturating_sub(last_prune_ms) >= PRUNE_INTERVAL_MS
-                    {
+                    if data.timestamp_ms.saturating_sub(last_prune_ms) >= PRUNE_INTERVAL_MS {
                         last_prune_ms = data.timestamp_ms;
-                        match collector_persistence.prune_traffic_buckets(
-                            collector_traffic_retention_days,
-                            data.timestamp_ms,
-                        ) {
-                            Ok(deleted) => {
-                                if deleted > 0 {
-                                    log::info!("hourly prune traffic buckets rows={deleted}");
-                                    if let Err(e) = collector_persistence.incremental_vacuum(64) {
-                                        log::warn!("incremental vacuum failed: {}", e);
+
+                        if collector_traffic_retention_days > 0 {
+                            let max_age_ms = (collector_traffic_retention_days as u64)
+                                .saturating_mul(24 * 60 * 60 * 1000);
+                            let cutoff_ms = data.timestamp_ms.saturating_sub(max_age_ms);
+                            let pruned = {
+                                let mut runtime_guard = collector_monitor_runtime.write().await;
+                                runtime_guard.prune_devices_older_than(cutoff_ms)
+                            };
+                            if pruned > 0 {
+                                log::info!("hourly prune remembered devices count={pruned}");
+                            }
+                        }
+
+                        if collector_traffic_enable_storage {
+                            match collector_persistence.prune_traffic_buckets(
+                                collector_traffic_retention_days,
+                                data.timestamp_ms,
+                            ) {
+                                Ok(deleted) => {
+                                    if deleted > 0 {
+                                        log::info!("hourly prune traffic buckets rows={deleted}");
+                                        if let Err(e) = collector_persistence.incremental_vacuum(64) {
+                                            log::warn!("incremental vacuum failed: {}", e);
+                                        }
                                     }
                                 }
+                                Err(e) => log::warn!("hourly prune traffic buckets failed: {}", e),
                             }
-                            Err(e) => log::warn!("hourly prune traffic buckets failed: {}", e),
                         }
                     }
                 }
