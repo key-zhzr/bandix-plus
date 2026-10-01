@@ -1069,6 +1069,87 @@ mod tests {
     }
 
     #[test]
+    fn current_hour_persistence_appends_only_new_points() {
+        let dir = temp_dir("incremental-current-hour");
+        let p = PersistenceManager::new(&dir).unwrap();
+        let topo = mock_topology();
+        let base = chrono::Local
+            .with_ymd_and_hms(2024, 1, 15, 10, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+
+        let mut first = HistogramHistory::new();
+        first.restore_current_hour_iface_state(
+            1,
+            base,
+            vec![
+                CurrentHourPointState {
+                    ts_ms: base + 1_000,
+                    metrics: CounterQuad {
+                        up_v4_bytes: 1,
+                        ..CounterQuad::default()
+                    },
+                },
+                CurrentHourPointState {
+                    ts_ms: base + 2_000,
+                    metrics: CounterQuad {
+                        up_v4_bytes: 2,
+                        ..CounterQuad::default()
+                    },
+                },
+            ],
+            base + 2_000,
+        );
+        p.save_current_hour_histogram(&first, &topo).unwrap();
+        assert_eq!(
+            p.query_i64_for_test("SELECT COUNT(*) FROM current_hour_points").unwrap(),
+            2
+        );
+
+        let mut second = HistogramHistory::new();
+        second.restore_current_hour_iface_state(
+            1,
+            base,
+            vec![
+                CurrentHourPointState {
+                    ts_ms: base + 1_000,
+                    metrics: CounterQuad {
+                        up_v4_bytes: 1,
+                        ..CounterQuad::default()
+                    },
+                },
+                CurrentHourPointState {
+                    ts_ms: base + 2_000,
+                    metrics: CounterQuad {
+                        up_v4_bytes: 2,
+                        ..CounterQuad::default()
+                    },
+                },
+                CurrentHourPointState {
+                    ts_ms: base + 3_000,
+                    metrics: CounterQuad {
+                        up_v4_bytes: 3,
+                        ..CounterQuad::default()
+                    },
+                },
+            ],
+            base + 3_000,
+        );
+        p.save_current_hour_histogram(&second, &topo).unwrap();
+
+        assert_eq!(
+            p.query_i64_for_test("SELECT COUNT(*) FROM current_hour_points").unwrap(),
+            3
+        );
+        let sum = p
+            .query_i64_for_test("SELECT SUM(up_v4_bytes) FROM current_hour_points")
+            .unwrap();
+        assert_eq!(sum, 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn append_and_load_device_bucket() {
         let dir = temp_dir("device");
         let p = PersistenceManager::new(&dir).unwrap();
