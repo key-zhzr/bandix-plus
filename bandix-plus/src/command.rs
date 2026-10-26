@@ -1,5 +1,5 @@
 use crate::api::{start_server, ApiState};
-use crate::ebpf::shared::load_ebpf_programs;
+use crate::ebpf::shared::{load_ebpf_programs, bpf_maps_snapshot, BpfMapsSnapshot};
 use crate::monitor::{
     build_recovered_snapshot, collect_snapshot, CompletedAggregate, CounterQuad, HistogramHistory, MonitorRuntime, TrafficHistory,
 };
@@ -159,6 +159,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let snapshot = Arc::new(RwLock::new(recovered_snapshot));
     let histogram = Arc::new(RwLock::new(histogram_raw));
     let monitor_ifaces = options.iface.clone();
+    let bpf_maps = Arc::new(RwLock::new(BpfMapsSnapshot::default()));
     let api_state = ApiState {
         snapshot: Arc::clone(&snapshot),
         history: Arc::clone(&history),
@@ -168,6 +169,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         topology: Arc::clone(&topology_state),
         persistence: Some(Arc::clone(&persistence)),
         traffic_enable_storage: options.traffic_enable_storage,
+        bpf_maps: Arc::clone(&bpf_maps),
     };
 
     // 解析 TC 后端/顺序并加载 eBPF 实例
@@ -180,7 +182,9 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.netlink_priority,
         options.tcx_anchor_ingress_id,
         options.tcx_anchor_egress_id,
+        options.bpf_map_max_entries,
     )?;
+    *bpf_maps.write().await = bpf_maps_snapshot(&ebpf, options.bpf_map_max_entries)?;
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
     let mut collector_ebpf = ebpf;
@@ -194,12 +198,25 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
     let collector_traffic_retention_days = options.traffic_retention_days;
+    let collector_bpf_capacity = options.bpf_map_max_entries;
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
+        let mut last_bpf_status_ms = 0u64;
         let mut last_prune_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
             ticker.tick().await;
+            let now = time_utils::now_millis();
+            if now.saturating_sub(last_bpf_status_ms) >= 10_000 {
+                last_bpf_status_ms = now;
+                match bpf_maps_snapshot(&collector_ebpf, collector_bpf_capacity) {
+                    Ok(status) => *bpf_maps.write().await = status,
+                    Err(error) => {
+                        log::warn!("BPF map status failed: {error}");
+                        bpf_maps.write().await.error = Some(error.to_string());
+                    }
+                }
+            }
             let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();
             {
                 let topology_guard = collector_topology.read().await;

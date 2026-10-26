@@ -17,6 +17,7 @@ use crate::monitor::{
     KnownDevice, MonitorRuntime, SnapshotData, TrafficHistory,
 };
 use crate::persistence::PersistenceManager;
+use crate::ebpf::shared::BpfMapsSnapshot;
 use crate::policy::{
     add_guest_whitelist, create_scheduled_rule, delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults,
     get_guest_whitelist, get_iface_limits, get_scheduled_rules, policy_items, remove_device_policy, remove_guest_whitelist,
@@ -37,13 +38,22 @@ pub struct ApiState {
     pub topology: Arc<RwLock<TopologySnapshot>>,
     pub persistence: Option<Arc<PersistenceManager>>,
     pub traffic_enable_storage: bool,
+    pub bpf_maps: Arc<RwLock<BpfMapsSnapshot>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct DevicesQuery {
     pub iface: Option<String>,
     pub period: Option<String>,
+    /// 从过滤后的设备列表中的哪个位置开始返回，默认 0。
+    pub offset: Option<usize>,
+    /// 本次最多返回多少条设备记录。
+    pub limit: Option<usize>,
 }
+/// 默认每页最多返回 100 条。
+const DEFAULT_DEVICES_PAGE_SIZE: usize = 100;
+/// 即使调用方指定更大的 limit，也不能超过 200 条。
+const MAX_DEVICES_PAGE_SIZE: usize = 200;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct OverviewQuery {
@@ -136,6 +146,7 @@ pub fn router(state: ApiState) -> Router {
 
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/bpf_maps", get(bpf_maps))
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices).delete(delete_device_handler))
@@ -264,6 +275,11 @@ async fn usage_ranking(
         data: items,
         error: None,
     }))
+}
+
+async fn bpf_maps(State(state): State<ApiState>) -> Json<ApiEnvelope<BpfMapsSnapshot>> {
+    let data = state.bpf_maps.read().await.clone();
+    Json(ApiEnvelope { ok: data.error.is_none(), error: data.error.clone(), data })
 }
 
 pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
@@ -405,7 +421,10 @@ async fn overview(
     })
 }
 
-async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
+async fn devices(
+    State(state): State<ApiState>,
+    Query(q): Query<DevicesQuery>,
+) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
     let period = match parse_period_scope(q.period.as_deref()) {
         Ok(v) => v,
         Err(e) => {
@@ -416,17 +435,45 @@ async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -
             });
         }
     };
-    let devices = state.snapshot.read().await.devices.clone();
-    let mut filtered: Vec<_> = devices
-        .into_iter()
-        .filter(|d| {
-            if let Some(ref iface) = q.iface {
-                if !iface.is_empty() && d.logical_iface != *iface {
-                    return false;
+
+    // 先筛选接口，再按接口名称和 MAC 地址排序，
+    // 保证连续分页时有稳定的记录顺序。
+    let mut matching: Vec<_> = {
+        let snapshot = state.snapshot.read().await;
+
+        snapshot
+            .devices
+            .iter()
+            .filter(|d| {
+                match q.iface.as_deref() {
+                    Some(iface) if !iface.is_empty() => {
+                        d.logical_iface.as_str() == iface
+                    }
+                    _ => true,
                 }
-            }
-            true
-        })
+            })
+            .cloned()
+            .collect()
+    };
+
+    matching.sort_by(|a, b| {
+        a.logical_iface
+            .cmp(&b.logical_iface)
+            .then_with(|| a.mac.cmp(&b.mac))
+    });
+
+    // 限制单次返回的记录数量。offset 超出记录数时返回空数组。
+    let offset = q.offset.unwrap_or(0).min(matching.len());
+
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_DEVICES_PAGE_SIZE)
+        .clamp(1, MAX_DEVICES_PAGE_SIZE);
+
+    let mut filtered: Vec<_> = matching
+        .into_iter()
+        .skip(offset)
+        .take(limit)
         .collect();
 
     if let Some(scope) = period {
@@ -481,6 +528,8 @@ async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -
             }
         }
     }
+
+    // 保持现有 ApiEnvelope + data 数组结构，减少 API 兼容性影响。
     Json(ApiEnvelope {
         ok: true,
         data: filtered,
@@ -1475,6 +1524,7 @@ mod tests {
             topology: Arc::new(RwLock::new(topo)),
             persistence: None,
             traffic_enable_storage: false,
+            bpf_maps: Arc::new(RwLock::new(BpfMapsSnapshot::default())),
         }
     }
 
@@ -1531,6 +1581,56 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
     }
+    
+    #[tokio::test]
+    async fn api_devices_with_offset_and_limit() {
+        let state = mock_api_state();
+
+        {
+            let mut snapshot = state.snapshot.write().await;
+
+            for i in 1..=5 {
+                snapshot.devices.push(DeviceListItem {
+                    ifindex: 1,
+                    logical_iface: "eth0".to_string(),
+                    subnet: "-".to_string(),
+                    ipv4: vec![],
+                    ipv6: vec![],
+                    mac: format!("02:00:00:00:00:{:02x}", i),
+                    hostname: format!("device-{}", i),
+                    metrics: CounterQuad::default(),
+                    cumulative: CounterQuad::default(),
+                    online: false,
+                    last_seen_ms: 0,
+                    neighbor_state: None,
+                });
+            }
+        }
+
+        let app = router(state);
+
+        let req = Request::get("/api/devices?iface=eth0&offset=1&limit=2")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> =
+            serde_json::from_slice(&body).unwrap();
+
+        assert!(env.ok);
+        assert_eq!(env.data.as_array().unwrap().len(), 2);
+        assert_eq!(
+            env.data[0]["mac"].as_str(),
+            Some("02:00:00:00:00:02")
+        );
+        assert_eq!(
+            env.data[1]["mac"].as_str(),
+            Some("02:00:00:00:00:03")
+        );
+    }
 
     #[tokio::test]
     async fn api_devices_with_period_all() {
@@ -1541,6 +1641,49 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(env.ok);
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_sqlite_totals_and_bounds() {
+        let mut state = mock_api_state();
+        let temp = std::env::temp_dir().join(format!("bandix-pagination-{}", uuid::Uuid::new_v4()));
+        let persistence = Arc::new(PersistenceManager::new(&temp).unwrap());
+        state.traffic_enable_storage = true;
+        state.persistence = Some(persistence.clone());
+        for i in (0..205).rev() {
+            let mac = format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256);
+            let mut bucket = empty_bucket(0, 3_599_999);
+            bucket.up_v4_bytes = i + 10;
+            bucket.down_v6_bytes = i + 20;
+            persistence.append_device_bucket("eth0", &mac, &bucket).unwrap();
+            state.snapshot.write().await.devices.push(DeviceListItem {
+                ifindex: 1, logical_iface: "eth0".into(), subnet: "-".into(), ipv4: vec![], ipv6: vec![],
+                mac, hostname: String::new(), metrics: CounterQuad::default(), cumulative: CounterQuad::default(),
+                online: false, last_seen_ms: 0, neighbor_state: None,
+            });
+        }
+        let app = router(state);
+        for (query, count, first) in [
+            ("period=all", 100, Some(0_u64)),
+            ("period=all&limit=999", 200, Some(0)),
+            ("period=all&offset=100&limit=999", 105, Some(100)),
+            ("period=all&offset=204&limit=0", 1, Some(204)),
+            ("period=all&offset=205", 0, None),
+        ] {
+            let request = Request::get(format!("/api/devices?{query}")).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+            assert!(env.ok, "{:?}", env.error);
+            assert_eq!(env.data.as_array().unwrap().len(), count);
+            if let Some(i) = first {
+                assert_eq!(env.data[0]["cumulative"]["up_v4_bytes"], i + 10);
+                assert_eq!(env.data[0]["cumulative"]["down_v6_bytes"], i + 20);
+            }
+        }
+        drop(app);
+        drop(persistence);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]
