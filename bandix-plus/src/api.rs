@@ -1650,9 +1650,11 @@ mod tests {
         let persistence = Arc::new(PersistenceManager::new(&temp).unwrap());
         state.traffic_enable_storage = true;
         state.persistence = Some(persistence.clone());
+        let now = now_millis();
+        let (year_start, _) = period_range_ms(PeriodScope::Year, now);
         for i in (0..205).rev() {
             let mac = format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256);
-            let mut bucket = empty_bucket(0, 3_599_999);
+            let mut bucket = empty_bucket((now / 3_600_000 * 3_600_000).max(year_start), now);
             bucket.up_v4_bytes = i + 10;
             bucket.down_v6_bytes = i + 20;
             persistence.append_device_bucket("eth0", &mac, &bucket).unwrap();
@@ -1664,11 +1666,11 @@ mod tests {
         }
         let app = router(state);
         for (query, count, first) in [
-            ("period=all", 100, Some(0_u64)),
-            ("period=all&limit=999", 200, Some(0)),
-            ("period=all&offset=100&limit=999", 105, Some(100)),
-            ("period=all&offset=204&limit=0", 1, Some(204)),
-            ("period=all&offset=205", 0, None),
+            ("period=year", 100, Some(0_u64)),
+            ("period=year&limit=999", 200, Some(0)),
+            ("period=year&offset=100&limit=999", 105, Some(100)),
+            ("period=year&offset=204&limit=0", 1, Some(204)),
+            ("period=year&offset=205", 0, None),
         ] {
             let request = Request::get(format!("/api/devices?{query}")).body(Body::empty()).unwrap();
             let response = app.clone().oneshot(request).await.unwrap();
