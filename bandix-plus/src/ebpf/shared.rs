@@ -1,10 +1,70 @@
-use aya::Ebpf;
 use aya::programs::{LinkOrder, ProgramId};
 use aya::programs::tc::{self, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType};
 use log::debug;
 use nix::sys::utsname;
+use aya::maps::{HashMap, Map};
+use aya::{Ebpf, Pod};
+use bandix_plus_common::{
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey,
+    InterfaceTrafficKey, RateBucketValue, RateLimitValue, TrafficValue,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::options::{TcBackend, TcOrder};
+
+pub const BANDIX_MAP_NAMES: [&str; 7] = [
+    "IFACE_TRAFFIC_STATS", "DEVICE_TRAFFIC_STATS", "DEVICE_LIMIT_GLOBAL",
+    "DEVICE_LIMIT_IFACE", "DEVICE_RATE_BUCKETS", "IFACE_LIMIT", "IFACE_RATE_BUCKETS",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BpfMapStatus {
+    pub name: String,
+    pub id: u32,
+    pub max_entries: u32,
+    pub entries: u32,
+    pub near_capacity: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BpfMapsSnapshot {
+    pub configured_max_entries: u32,
+    pub timestamp_ms: u64,
+    pub maps: Vec<BpfMapStatus>,
+    pub error: Option<String>,
+}
+
+fn describe_map<K: Pod, V: Pod>(ebpf: &Ebpf, name: &str) -> anyhow::Result<BpfMapStatus> {
+    let map = ebpf.map(name).ok_or_else(|| anyhow::anyhow!("missing BPF map {name}"))?;
+    let Map::HashMap(data) = map else { anyhow::bail!("{name} is not a hash map") };
+    let info = data.info()?;
+    let typed = HashMap::<_, K, V>::try_from(map)?;
+    // Counts are approximate while traffic changes the map. Bound traversal even
+    // if a concurrently removed key makes the kernel iterator restart.
+    let entries = typed.keys().take(info.max_entries() as usize)
+        .try_fold(0_u32, |count, key| key.map(|_| count + 1))?;
+    Ok(BpfMapStatus {
+        name: name.to_string(), id: info.id(), max_entries: info.max_entries(), entries,
+        near_capacity: u64::from(entries) * 100 >= u64::from(info.max_entries()) * 80,
+    })
+}
+
+pub fn bpf_maps_snapshot(ebpf: &Ebpf, configured_max_entries: u32) -> anyhow::Result<BpfMapsSnapshot> {
+    Ok(BpfMapsSnapshot {
+        configured_max_entries,
+        timestamp_ms: crate::utils::time_utils::now_millis(),
+        maps: vec![
+            describe_map::<InterfaceTrafficKey, TrafficValue>(ebpf, "IFACE_TRAFFIC_STATS")?,
+            describe_map::<DeviceTrafficKey, TrafficValue>(ebpf, "DEVICE_TRAFFIC_STATS")?,
+            describe_map::<DeviceGlobalLimitKey, RateLimitValue>(ebpf, "DEVICE_LIMIT_GLOBAL")?,
+            describe_map::<DeviceIfaceLimitKey, RateLimitValue>(ebpf, "DEVICE_LIMIT_IFACE")?,
+            describe_map::<DeviceIfaceLimitKey, RateBucketValue>(ebpf, "DEVICE_RATE_BUCKETS")?,
+            describe_map::<IfaceLimitKey, RateLimitValue>(ebpf, "IFACE_LIMIT")?,
+            describe_map::<InterfaceTrafficKey, RateBucketValue>(ebpf, "IFACE_RATE_BUCKETS")?,
+        ],
+        error: None,
+    })
+}
 
 /// 判断内核版本是否大于等于指定版本号
 fn kernel_at_least(major: u32, minor: u32, patch: u32) -> bool {
@@ -54,12 +114,18 @@ pub fn load_ebpf_programs(
     netlink_priority: Option<u16>,
     tcx_anchor_ingress_id: Option<u32>,
     tcx_anchor_egress_id: Option<u32>,
+    bpf_map_max_entries: u32,
 ) -> anyhow::Result<Ebpf> {
     remove_rlimit_memlock();
 
-    let mut ebpf = aya::EbpfLoader::new()
-        .load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/bandix-plus")))
+    anyhow::ensure!((1024..=65536).contains(&bpf_map_max_entries), "BPF map capacity must be 1024..65536");
+    let mut loader = aya::EbpfLoader::new();
+    for name in BANDIX_MAP_NAMES {
+        loader.map_max_entries(name, bpf_map_max_entries);
+    }
+    let mut ebpf = loader.load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/bandix-plus")))
         .map_err(|e: aya::EbpfError| anyhow::anyhow!("Failed to load eBPF program: {}", e))?;
+    log::info!("BPF map capacity: {} entries in each of {} maps", bpf_map_max_entries, BANDIX_MAP_NAMES.len());
 
     // 把 eBPF 在内核中的日志，拉到用户态输出
     match aya_log::EbpfLogger::init(&mut ebpf) {

@@ -66,6 +66,20 @@ impl MonitorRuntime {
         removed |= self.prev_device_bytes.len() != before;
         removed
     }
+
+    /// Bound the remembered-device registry using last-seen time.
+    pub fn prune_devices_older_than(&mut self, cutoff_ms: u64) -> usize {
+        let stale: Vec<(u32, [u8; 6])> = self
+            .device_registry
+            .entries
+            .iter()
+            .filter_map(|(key, dev)| (dev.last_seen_ms < cutoff_ms).then_some(*key))
+            .collect();
+        for (ifindex, mac) in &stale {
+            let _ = self.remove_device(*ifindex, *mac);
+        }
+        stale.len()
+    }
 }
 
 pub fn export_runtime_state(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> MonitorRuntimeState {
@@ -359,17 +373,34 @@ impl AggregatedBucket {
 
 const HISTOGRAM_MAX_HOURS: usize = 366 * 24;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HistogramHistory {
-    current_hour_iface: HashMap<u32, (u64, Vec<HistoryPoint>)>,
-    current_hour_device: HashMap<DeviceSeriesKey, (u64, Vec<HistoryPoint>)>,
+    current_hour_iface: HashMap<u32, (u64, Vec<CurrentHourPointState>)>,
+    current_hour_device: HashMap<DeviceSeriesKey, (u64, Vec<CurrentHourPointState>)>,
     completed_iface: HashMap<u32, VecDeque<AggregatedBucket>>,
     completed_device: HashMap<DeviceSeriesKey, VecDeque<AggregatedBucket>>,
+    max_completed_hours: usize,
+}
+
+impl Default for HistogramHistory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HistogramHistory {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_completed_hours(HISTOGRAM_MAX_HOURS)
+    }
+
+    pub fn with_max_completed_hours(max_completed_hours: usize) -> Self {
+        Self {
+            current_hour_iface: HashMap::new(),
+            current_hour_device: HashMap::new(),
+            completed_iface: HashMap::new(),
+            completed_device: HashMap::new(),
+            max_completed_hours,
+        }
     }
 
     /// Remove current-hour and completed histogram data for one device.
@@ -403,7 +434,62 @@ impl HistogramHistory {
                 });
             }
         }
+
+        // Offline devices remain in SnapshotData for UI/history metadata, but must not
+        // receive one zero-valued point every second. Finalize a stale active series
+        // once the wall-clock hour changes, then free it even if the device stayed offline.
+        let (new_hour_start, _) = hourly_bucket_local(snapshot.timestamp_ms);
+        let iface_by_key: HashMap<DeviceSeriesKey, String> = snapshot
+            .devices
+            .iter()
+            .map(|dev| {
+                (
+                    DeviceSeriesKey {
+                        ifindex: dev.ifindex,
+                        mac: dev.mac.clone(),
+                    },
+                    dev.logical_iface.clone(),
+                )
+            })
+            .collect();
+        let stale_keys: Vec<DeviceSeriesKey> = self
+            .current_hour_device
+            .iter()
+            .filter_map(|(key, (hour_start, _))| {
+                let (series_start, _) = hourly_bucket_local(*hour_start);
+                (series_start != new_hour_start).then(|| key.clone())
+            })
+            .collect();
+
+        for key in stale_keys {
+            let Some((hour_start, points)) = self.current_hour_device.remove(&key) else {
+                continue;
+            };
+            if points.is_empty() {
+                continue;
+            }
+            let (series_start, _) = hourly_bucket_local(hour_start);
+            let bucket = points_to_bucket(series_start, &points);
+            if !bucket_has_traffic(&bucket) {
+                continue;
+            }
+            if self.max_completed_hours > 0 {
+                self.completed_device.entry(key.clone()).or_default().push_back(bucket.clone());
+                trim_histogram_completed(self.completed_device.get_mut(&key).unwrap(), self.max_completed_hours);
+            }
+            if let Some(iface) = iface_by_key.get(&key) {
+                completed.push(CompletedAggregate::Device {
+                    iface: iface.clone(),
+                    mac: key.mac.clone(),
+                    bucket,
+                });
+            }
+        }
+
         for dev in &snapshot.devices {
+            if !dev.online {
+                continue;
+            }
             let key = DeviceSeriesKey {
                 ifindex: dev.ifindex,
                 mac: dev.mac.clone(),
@@ -420,17 +506,23 @@ impl HistogramHistory {
     }
 
     pub fn restore_iface_bucket(&mut self, ifindex: u32, bucket: AggregatedBucket) {
+        if self.max_completed_hours == 0 {
+            return;
+        }
         self.completed_iface.entry(ifindex).or_default().push_back(bucket);
         if let Some(q) = self.completed_iface.get_mut(&ifindex) {
-            trim_histogram_completed(q, HISTOGRAM_MAX_HOURS);
+            trim_histogram_completed(q, self.max_completed_hours);
         }
     }
 
     pub fn restore_device_bucket(&mut self, ifindex: u32, mac: String, bucket: AggregatedBucket) {
+        if self.max_completed_hours == 0 {
+            return;
+        }
         let key = DeviceSeriesKey { ifindex, mac };
         self.completed_device.entry(key.clone()).or_default().push_back(bucket);
         if let Some(q) = self.completed_device.get_mut(&key) {
-            trim_histogram_completed(q, HISTOGRAM_MAX_HOURS);
+            trim_histogram_completed(q, self.max_completed_hours);
         }
     }
 
@@ -450,21 +542,23 @@ impl HistogramHistory {
     }
 
     pub fn export_current_hour_state(&self) -> CurrentHourState {
+        self.export_current_hour_state_since(0)
+    }
+
+    pub fn export_current_hour_state_since(&self, since_ms: u64) -> CurrentHourState {
         let mut iface = Vec::new();
         for (ifindex, (hour_start_ts_ms, points)) in &self.current_hour_iface {
             if points.is_empty() {
                 continue;
             }
+            let filtered: Vec<CurrentHourPointState> = points.iter().filter(|p| p.ts_ms > since_ms).cloned().collect();
+            if filtered.is_empty() {
+                continue;
+            }
             iface.push(CurrentHourIfaceState {
                 ifindex: *ifindex,
                 hour_start_ts_ms: *hour_start_ts_ms,
-                points: points
-                    .iter()
-                    .map(|p| CurrentHourPointState {
-                        ts_ms: p.ts_ms,
-                        metrics: p.metrics,
-                    })
-                    .collect(),
+                points: filtered,
             });
         }
         iface.sort_by_key(|x| x.ifindex);
@@ -474,17 +568,15 @@ impl HistogramHistory {
             if points.is_empty() {
                 continue;
             }
+            let filtered: Vec<CurrentHourPointState> = points.iter().filter(|p| p.ts_ms > since_ms).cloned().collect();
+            if filtered.is_empty() {
+                continue;
+            }
             device.push(CurrentHourDeviceState {
                 ifindex: key.ifindex,
                 mac: key.mac.clone(),
                 hour_start_ts_ms: *hour_start_ts_ms,
-                points: points
-                    .iter()
-                    .map(|p| CurrentHourPointState {
-                        ts_ms: p.ts_ms,
-                        metrics: p.metrics,
-                    })
-                    .collect(),
+                points: filtered,
             });
         }
         device.sort_by(|a, b| a.ifindex.cmp(&b.ifindex).then(a.mac.cmp(&b.mac)));
@@ -522,36 +614,30 @@ impl HistogramHistory {
 
     fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
-        let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
-            (
-                hour_start,
-                vec![HistoryPoint {
-                    ts_ms,
-                    metrics: *metrics,
-                    cumulative: CounterQuad::default(),
-                }],
-            )
-        });
+        let entry = self
+            .current_hour_iface
+            .entry(ifindex)
+            .or_insert_with(|| (hour_start, Vec::new()));
         let (cur_hour, points) = entry;
         let (cur_start, _) = hourly_bucket_local(*cur_hour);
         let (new_start, _) = hourly_bucket_local(ts_ms);
         if cur_start == new_start {
-            points.push(HistoryPoint {
+            points.push(CurrentHourPointState {
                 ts_ms,
                 metrics: *metrics,
-                cumulative: CounterQuad::default(),
             });
             None
         } else {
             let bucket = points_to_bucket(cur_start, points);
-            self.completed_iface.entry(ifindex).or_default().push_back(bucket.clone());
-            trim_histogram_completed(self.completed_iface.get_mut(&ifindex).unwrap(), HISTOGRAM_MAX_HOURS);
+            if self.max_completed_hours > 0 {
+                self.completed_iface.entry(ifindex).or_default().push_back(bucket.clone());
+                trim_histogram_completed(self.completed_iface.get_mut(&ifindex).unwrap(), self.max_completed_hours);
+            }
             *entry = (
                 new_start,
-                vec![HistoryPoint {
+                vec![CurrentHourPointState {
                     ts_ms,
                     metrics: *metrics,
-                    cumulative: CounterQuad::default(),
                 }],
             );
             Some(bucket)
@@ -560,39 +646,33 @@ impl HistogramHistory {
 
     fn ingest_device(&mut self, key: &DeviceSeriesKey, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
-        let entry = self.current_hour_device.entry(key.clone()).or_insert_with(|| {
-            (
-                hour_start,
-                vec![HistoryPoint {
-                    ts_ms,
-                    metrics: *metrics,
-                    cumulative: CounterQuad::default(),
-                }],
-            )
-        });
+        let entry = self
+            .current_hour_device
+            .entry(key.clone())
+            .or_insert_with(|| (hour_start, Vec::new()));
         let (cur_hour, points) = entry;
         let (cur_start, _) = hourly_bucket_local(*cur_hour);
         let (new_start, _) = hourly_bucket_local(ts_ms);
         if cur_start == new_start {
-            points.push(HistoryPoint {
+            points.push(CurrentHourPointState {
                 ts_ms,
                 metrics: *metrics,
-                cumulative: CounterQuad::default(),
             });
             None
         } else {
             let bucket = points_to_bucket(cur_start, points);
-            self.completed_device.entry(key.clone()).or_default().push_back(bucket.clone());
-            trim_histogram_completed(self.completed_device.get_mut(key).unwrap(), HISTOGRAM_MAX_HOURS);
+            if self.max_completed_hours > 0 && bucket_has_traffic(&bucket) {
+                self.completed_device.entry(key.clone()).or_default().push_back(bucket.clone());
+                trim_histogram_completed(self.completed_device.get_mut(key).unwrap(), self.max_completed_hours);
+            }
             *entry = (
                 new_start,
-                vec![HistoryPoint {
+                vec![CurrentHourPointState {
                     ts_ms,
                     metrics: *metrics,
-                    cumulative: CounterQuad::default(),
                 }],
             );
-            Some(bucket)
+            bucket_has_traffic(&bucket).then_some(bucket)
         }
     }
 
@@ -726,20 +806,15 @@ fn normalize_current_hour_points(
     hour_start_ts_ms: u64,
     points: Vec<CurrentHourPointState>,
     now_ms: u64,
-) -> Option<(u64, Vec<HistoryPoint>)> {
+) -> Option<(u64, Vec<CurrentHourPointState>)> {
     let (expected_start, expected_end) = hourly_bucket_local(now_ms);
     if hour_start_ts_ms != expected_start {
         return None;
     }
 
-    let mut restored: Vec<HistoryPoint> = points
+    let mut restored: Vec<CurrentHourPointState> = points
         .into_iter()
         .filter(|p| p.ts_ms >= expected_start && p.ts_ms <= expected_end)
-        .map(|p| HistoryPoint {
-            ts_ms: p.ts_ms,
-            metrics: p.metrics,
-            cumulative: CounterQuad::default(),
-        })
         .collect();
     restored.sort_by_key(|p| p.ts_ms);
     restored.dedup_by_key(|p| p.ts_ms);
@@ -757,14 +832,10 @@ pub(crate) fn promote_stale_points_to_bucket(hour_start_ts_ms: u64, points: &[Cu
     if hour_start_ts_ms != expected_start {
         return None;
     }
-    let mut restored: Vec<HistoryPoint> = points
+    let mut restored: Vec<CurrentHourPointState> = points
         .iter()
         .filter(|p| p.ts_ms >= expected_start && p.ts_ms <= expected_end)
-        .map(|p| HistoryPoint {
-            ts_ms: p.ts_ms,
-            metrics: p.metrics,
-            cumulative: CounterQuad::default(),
-        })
+        .cloned()
         .collect();
     if restored.is_empty() {
         return None;
@@ -774,7 +845,7 @@ pub(crate) fn promote_stale_points_to_bucket(hour_start_ts_ms: u64, points: &[Cu
     Some(points_to_bucket(hour_start_ts_ms, &restored))
 }
 
-fn points_to_bucket(start_ms: u64, points: &[HistoryPoint]) -> AggregatedBucket {
+fn points_to_bucket(start_ms: u64, points: &[CurrentHourPointState]) -> AggregatedBucket {
     let (_, end_ms) = hourly_bucket_local(start_ms);
     let mut accum = BucketAccum {
         start_ts_ms: start_ms,
@@ -795,13 +866,24 @@ fn points_to_bucket(start_ms: u64, points: &[HistoryPoint]) -> AggregatedBucket 
     bucket_accum_to_aggregated(accum)
 }
 
+fn bucket_has_traffic(bucket: &AggregatedBucket) -> bool {
+    bucket.up_v4_bytes != 0
+        || bucket.down_v4_bytes != 0
+        || bucket.up_v6_bytes != 0
+        || bucket.down_v6_bytes != 0
+        || bucket.up_v4_bps_max != 0
+        || bucket.down_v4_bps_max != 0
+        || bucket.up_v6_bps_max != 0
+        || bucket.down_v6_bps_max != 0
+}
+
 fn trim_histogram_completed(queue: &mut VecDeque<AggregatedBucket>, max_hours: usize) {
     while queue.len() > max_hours {
         let _ = queue.pop_front();
     }
 }
 
-fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
+pub(crate) fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
     let mut by_day: HashMap<u64, BucketAccum> = HashMap::new();
     for b in hourly {
         let (day_start, day_end) = daily_bucket_local(b.start_ts_ms);
@@ -854,6 +936,18 @@ impl TrafficHistory {
 
     /// 将一次快照数据写入历史，供后续按接口或设备查询
     pub fn ingest_snapshot(&mut self, snapshot: &SnapshotData) {
+        // A device that goes offline no longer receives 1 Hz samples. Drop its
+        // last trend queue once the configured high-resolution window has
+        // elapsed, otherwise each historical MAC keeps a VecDeque forever.
+        let max_age_ms = (self.window_points as u64).saturating_mul(1_000);
+        let cutoff_ms = snapshot.timestamp_ms.saturating_sub(max_age_ms);
+        self.device_series.retain(|_, series| {
+            series
+                .back()
+                .map(|point| point.ts_ms >= cutoff_ms)
+                .unwrap_or(false)
+        });
+
         for iface in &snapshot.interfaces {
             let queue = self.iface_series.entry(iface.ifindex).or_default();
             queue.push_back(HistoryPoint {
@@ -865,6 +959,9 @@ impl TrafficHistory {
         }
 
         for dev in &snapshot.devices {
+            if !dev.online {
+                continue;
+            }
             let key = DeviceSeriesKey {
                 ifindex: dev.ifindex,
                 mac: dev.mac.clone(),
@@ -1631,3 +1728,153 @@ mod boundary_tests {
         let _ = now;
     }
 }
+
+#[cfg(test)]
+mod memory_regression_tests {
+    use super::*;
+    use chrono::{Local, TimeZone};
+
+    fn device_snapshot(ts_ms: u64, online: bool, up_bytes: u64) -> SnapshotData {
+        SnapshotData {
+            timestamp_ms: ts_ms,
+            interfaces: Vec::new(),
+            devices: vec![DeviceListItem {
+                ifindex: 7,
+                logical_iface: "br-lan".to_string(),
+                subnet: "192.168.1.0/24".to_string(),
+                ipv4: vec!["192.168.1.2".to_string()],
+                ipv6: Vec::new(),
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                hostname: "test".to_string(),
+                metrics: CounterQuad {
+                    up_v4_bytes: up_bytes,
+                    up_v4_bps: up_bytes.saturating_mul(8),
+                    ..CounterQuad::default()
+                },
+                cumulative: CounterQuad {
+                    up_v4_bytes: up_bytes,
+                    ..CounterQuad::default()
+                },
+                online,
+                last_seen_ms: ts_ms,
+                neighbor_state: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn monitor_runtime_prunes_stale_device_state() {
+        let mut runtime = MonitorRuntime::default();
+        let mac_old = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01];
+        let mac_new = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02];
+
+        for (mac, last_seen_ms) in [(mac_old, 1_000_u64), (mac_new, 9_000_u64)] {
+            runtime.device_registry.entries.insert(
+                (7, mac),
+                KnownDevice {
+                    ifindex: 7,
+                    mac,
+                    ipv4: vec!["192.168.1.2".to_string()],
+                    ipv6: Vec::new(),
+                    hostname: "test".to_string(),
+                    logical_iface: "br-lan".to_string(),
+                    subnet: "192.168.1.0/24".to_string(),
+                    last_seen_ms,
+                },
+            );
+            runtime.cumulative_device.insert((7, mac), CounterQuad::default());
+            runtime.prev_device_bytes.insert(
+                DeviceTrafficKey {
+                    ifindex: 7,
+                    mac,
+                    ip_version: 4,
+                    direction: 0,
+                },
+                123,
+            );
+        }
+
+        assert_eq!(runtime.prune_devices_older_than(5_000), 1);
+        assert!(!runtime.device_registry.entries.contains_key(&(7, mac_old)));
+        assert!(!runtime.cumulative_device.contains_key(&(7, mac_old)));
+        assert!(runtime.prev_device_bytes.keys().all(|k| k.mac != mac_old));
+
+        assert!(runtime.device_registry.entries.contains_key(&(7, mac_new)));
+        assert!(runtime.cumulative_device.contains_key(&(7, mac_new)));
+        assert!(runtime.prev_device_bytes.keys().any(|k| k.mac == mac_new));
+    }
+
+    #[test]
+    fn recent_history_reclaims_stale_offline_device_queue() {
+        let mut history = TrafficHistory::new(3);
+        history.ingest_snapshot(&device_snapshot(1_000, true, 1));
+        assert_eq!(history.device_series.len(), 1);
+
+        // The queue remains available inside the 3-second trend window.
+        history.ingest_snapshot(&device_snapshot(3_000, false, 0));
+        assert_eq!(history.device_series.len(), 1);
+
+        // Once the last online sample ages out, the per-device VecDeque is freed.
+        history.ingest_snapshot(&device_snapshot(4_001, false, 0));
+        assert!(history.device_series.is_empty());
+    }
+
+    #[test]
+    fn recent_history_does_not_sample_offline_devices() {
+        let mut history = TrafficHistory::new(600);
+        history.ingest_snapshot(&device_snapshot(1_000, false, 0));
+        assert!(history.device_series.is_empty());
+    }
+
+    #[test]
+    fn offline_device_series_is_finalized_and_freed_at_hour_boundary() {
+        let first = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let next = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+
+        let mut history = HistogramHistory::new();
+        assert!(history
+            .ingest_snapshot_collect_completed(&device_snapshot(first, true, 10))
+            .is_empty());
+
+        let completed = history.ingest_snapshot_collect_completed(&device_snapshot(next, false, 0));
+        assert_eq!(completed.len(), 1);
+        match &completed[0] {
+            CompletedAggregate::Device { bucket, .. } => assert_eq!(bucket.up_v4_bytes, 10),
+            _ => panic!("expected device bucket"),
+        }
+        assert!(history.current_hour_device.is_empty());
+    }
+
+    #[test]
+    fn first_sample_of_hour_is_not_double_counted() {
+        let first = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let next = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+
+        let mut history = HistogramHistory::new();
+        history.ingest_snapshot_collect_completed(&device_snapshot(first, true, 123));
+        let completed = history.ingest_snapshot_collect_completed(&device_snapshot(next, true, 1));
+
+        let old = completed
+            .iter()
+            .find_map(|item| match item {
+                CompletedAggregate::Device { bucket, .. } if bucket.start_ts_ms < next => Some(bucket),
+                _ => None,
+            })
+            .expect("old hour should complete");
+        assert_eq!(old.up_v4_bytes, 123);
+    }
+
+    #[test]
+    fn persistence_mode_does_not_retain_completed_buckets_in_ram() {
+        let first = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let next = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+
+        let mut history = HistogramHistory::with_max_completed_hours(0);
+        history.ingest_snapshot_collect_completed(&device_snapshot(first, true, 10));
+        let completed = history.ingest_snapshot_collect_completed(&device_snapshot(next, true, 1));
+
+        assert_eq!(completed.len(), 1);
+        assert!(history.completed_device.is_empty());
+    }
+}
+

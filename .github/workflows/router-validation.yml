@@ -1,0 +1,50 @@
+name: router-validation
+on:
+  push:
+    branches: [codex/bandix-pagination-map-capacity-20261027]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - bandix-plus/**
+      - bandix-plus-common/**
+      - bandix-plus-ebpf/**
+      - build_release.sh
+      - install_dependencies.sh
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the existing release toolchain
+        run: bash install_dependencies.sh
+      - uses: Swatinem/rust-cache@v2
+      - name: Core regression tests
+        env:
+          AYA_BUILD_SKIP: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked -p bandix-plus 2>&1 | tee core-tests.log
+      - name: Build aarch64 musl and eBPF
+        run: bash build_release.sh
+      - name: Prepare validated deployment binary
+        run: |
+          mkdir -p deployment
+          cp target/aarch64-unknown-linux-musl/release/bandix-plus deployment/
+          "$HOME/musl-cross/aarch64-linux-musl-cross/bin/aarch64-linux-musl-strip" --strip-all deployment/bandix-plus
+          printf 'source_commit=%s\nversion=0.1.7\n' "$GITHUB_SHA" > deployment/build-info.txt
+          sha256sum deployment/bandix-plus release/*.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bandix-plus-0.1.7-aarch64
+          path: |
+            deployment/
+            release/*.tar.gz
+            SHA256SUMS
+            core-tests.log
+          retention-days: 30

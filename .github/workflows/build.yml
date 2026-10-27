@@ -6,6 +6,9 @@ name: "build"
 permissions:
   contents: write
 on:
+  push:
+    branches:
+      - release/v0.1.6
   repository_dispatch:
   workflow_dispatch:
     inputs:
@@ -88,5 +91,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{steps.check_version.outputs.latest_version}}
+          target_commitish: ${{ github.sha }}
           body_path: release.txt
           files: ${{ steps.prepare_release.outputs.release_path }}/*

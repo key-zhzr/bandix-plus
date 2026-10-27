@@ -1,6 +1,8 @@
 use crate::api::{start_server, ApiState};
-use crate::ebpf::shared::load_ebpf_programs;
-use crate::monitor::{build_recovered_snapshot, collect_snapshot, CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory};
+use crate::ebpf::shared::{load_ebpf_programs, bpf_maps_snapshot, BpfMapsSnapshot};
+use crate::monitor::{
+    build_recovered_snapshot, collect_snapshot, CompletedAggregate, CounterQuad, HistogramHistory, MonitorRuntime, TrafficHistory,
+};
 use crate::options::{Options, TcBackend, TcOrder};
 use crate::persistence::PersistenceManager;
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy_runtime_summary, parse_policy};
@@ -99,27 +101,55 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     if let Err(e) = persistence.load_monitor_runtime(&mut monitor_runtime, &topology) {
         log::warn!("load devices state failed: {}", e);
     }
+    if options.traffic_retention_days > 0 {
+        let max_age_ms = (options.traffic_retention_days as u64)
+            .saturating_mul(24 * 60 * 60 * 1000);
+        let cutoff_ms = time_utils::now_millis().saturating_sub(max_age_ms);
+        let pruned = monitor_runtime.prune_devices_older_than(cutoff_ms);
+        if pruned > 0 {
+            log::info!("pruned expired remembered devices count={pruned}");
+        }
+    }
     log::info!("devices.loaded known_devices={}", monitor_runtime.device_registry.entries.len());
 
     let collect_interval_secs = 1_u64;
     let history_points = ((options.history_window_minutes as u64) * 60).max(1) as usize;
     let history = Arc::new(RwLock::new(TrafficHistory::new(history_points)));
 
-    let mut histogram_raw = HistogramHistory::new();
-    if options.traffic_enable_storage {
-        if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
-            log::warn!("load traffic histogram state failed: {}", e);
-        }
-    }
+    // With persistent storage enabled, SQLite is the source of truth for
+    // completed hourly buckets. Keep only the active hour in RAM.
+    let mut histogram_raw = if options.traffic_enable_storage {
+        HistogramHistory::with_max_completed_hours(0)
+    } else {
+        HistogramHistory::new()
+    };
     let recovery_now_ms = time_utils::now_millis();
     if options.traffic_enable_storage {
         if let Err(e) = persistence.load_current_hour_histogram(&topology, &mut histogram_raw, recovery_now_ms) {
             log::warn!("load current-hour histogram state failed: {}", e);
         }
     }
-    let (ring_iface_cumulative, ring_device_cumulative) = histogram_raw.cumulative_from_all();
-    monitor_runtime.cumulative_iface = ring_iface_cumulative;
-    monitor_runtime.cumulative_device = ring_device_cumulative;
+
+    let (mut iface_cumulative, mut device_cumulative) = if options.traffic_enable_storage {
+        match persistence.load_cumulative(&topology) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("load persisted cumulative traffic failed: {}", e);
+                (Default::default(), Default::default())
+            }
+        }
+    } else {
+        (Default::default(), Default::default())
+    };
+    let (current_iface, current_device) = histogram_raw.cumulative_from_all();
+    for (ifindex, current) in current_iface {
+        add_counter_bytes(iface_cumulative.entry(ifindex).or_default(), &current);
+    }
+    for (key, current) in current_device {
+        add_counter_bytes(device_cumulative.entry(key).or_default(), &current);
+    }
+    monitor_runtime.cumulative_iface = iface_cumulative;
+    monitor_runtime.cumulative_device = device_cumulative;
 
     let monitor_runtime = Arc::new(RwLock::new(monitor_runtime));
     let recovered_snapshot = {
@@ -129,6 +159,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let snapshot = Arc::new(RwLock::new(recovered_snapshot));
     let histogram = Arc::new(RwLock::new(histogram_raw));
     let monitor_ifaces = options.iface.clone();
+    let bpf_maps = Arc::new(RwLock::new(BpfMapsSnapshot::default()));
     let api_state = ApiState {
         snapshot: Arc::clone(&snapshot),
         history: Arc::clone(&history),
@@ -138,6 +169,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         topology: Arc::clone(&topology_state),
         persistence: Some(Arc::clone(&persistence)),
         traffic_enable_storage: options.traffic_enable_storage,
+        bpf_maps: Arc::clone(&bpf_maps),
     };
 
     // 解析 TC 后端/顺序并加载 eBPF 实例
@@ -150,7 +182,9 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.netlink_priority,
         options.tcx_anchor_ingress_id,
         options.tcx_anchor_egress_id,
+        options.bpf_map_max_entries,
     )?;
+    *bpf_maps.write().await = bpf_maps_snapshot(&ebpf, options.bpf_map_max_entries)?;
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
     let mut collector_ebpf = ebpf;
@@ -164,12 +198,25 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
     let collector_traffic_retention_days = options.traffic_retention_days;
+    let collector_bpf_capacity = options.bpf_map_max_entries;
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
+        let mut last_bpf_status_ms = 0u64;
         let mut last_prune_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
             ticker.tick().await;
+            let now = time_utils::now_millis();
+            if now.saturating_sub(last_bpf_status_ms) >= 10_000 {
+                last_bpf_status_ms = now;
+                match bpf_maps_snapshot(&collector_ebpf, collector_bpf_capacity) {
+                    Ok(status) => *bpf_maps.write().await = status,
+                    Err(error) => {
+                        log::warn!("BPF map status failed: {error}");
+                        bpf_maps.write().await.error = Some(error.to_string());
+                    }
+                }
+            }
             let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();
             {
                 let topology_guard = collector_topology.read().await;
@@ -210,12 +257,12 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                             match item {
                                 CompletedAggregate::Iface { iface, bucket } => {
                                     if let Err(e) = collector_persistence.append_iface_bucket(&iface, &bucket) {
-                                        log::error!("persist iface ring failed iface={} err={}", iface, e);
+                                        log::error!("persist iface bucket failed iface={} err={}", iface, e);
                                     }
                                 }
                                 CompletedAggregate::Device { iface, mac, bucket } => {
                                     if let Err(e) = collector_persistence.append_device_bucket(&iface, &mac, &bucket) {
-                                        log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
+                                        log::error!("persist device bucket failed iface={} mac={} err={}", iface, mac, e);
                                     }
                                 }
                             }
@@ -227,6 +274,9 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                     }
 
                     if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
+                        // Track attempts rather than only successes. Otherwise a single
+                        // persistence error makes the 1 Hz collector retry heavy I/O every second.
+                        last_periodic_persist_ms = data.timestamp_ms;
                         let topo = collector_topology.read().await.clone();
                         let runtime_saved = {
                             let runtime_guard = collector_monitor_runtime.read().await;
@@ -252,28 +302,42 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                             true
                         };
 
-                        if runtime_saved && histogram_saved {
-                            last_periodic_persist_ms = data.timestamp_ms;
+                        if !(runtime_saved && histogram_saved) {
+                            log::warn!("periodic persistence incomplete; next retry in about 60s");
                         }
                     }
 
-                    if collector_traffic_enable_storage
-                        && data.timestamp_ms.saturating_sub(last_prune_ms) >= PRUNE_INTERVAL_MS
-                    {
-                        match collector_persistence.prune_traffic_buckets(
-                            collector_traffic_retention_days,
-                            data.timestamp_ms,
-                        ) {
-                            Ok(deleted) => {
-                                if deleted > 0 {
-                                    log::info!("hourly prune traffic buckets rows={deleted}");
-                                    if let Err(e) = collector_persistence.incremental_vacuum(64) {
-                                        log::warn!("incremental vacuum failed: {}", e);
+                    if data.timestamp_ms.saturating_sub(last_prune_ms) >= PRUNE_INTERVAL_MS {
+                        last_prune_ms = data.timestamp_ms;
+
+                        if collector_traffic_retention_days > 0 {
+                            let max_age_ms = (collector_traffic_retention_days as u64)
+                                .saturating_mul(24 * 60 * 60 * 1000);
+                            let cutoff_ms = data.timestamp_ms.saturating_sub(max_age_ms);
+                            let pruned = {
+                                let mut runtime_guard = collector_monitor_runtime.write().await;
+                                runtime_guard.prune_devices_older_than(cutoff_ms)
+                            };
+                            if pruned > 0 {
+                                log::info!("hourly prune remembered devices count={pruned}");
+                            }
+                        }
+
+                        if collector_traffic_enable_storage {
+                            match collector_persistence.prune_traffic_buckets(
+                                collector_traffic_retention_days,
+                                data.timestamp_ms,
+                            ) {
+                                Ok(deleted) => {
+                                    if deleted > 0 {
+                                        log::info!("hourly prune traffic buckets rows={deleted}");
+                                        if let Err(e) = collector_persistence.incremental_vacuum(64) {
+                                            log::warn!("incremental vacuum failed: {}", e);
+                                        }
                                     }
                                 }
-                                last_prune_ms = data.timestamp_ms;
+                                Err(e) => log::warn!("hourly prune traffic buckets failed: {}", e),
                             }
-                            Err(e) => log::warn!("hourly prune traffic buckets failed: {}", e),
                         }
                     }
                 }
@@ -288,6 +352,13 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     start_server(&bind_addr, api_state).await?;
 
     Ok(())
+}
+
+fn add_counter_bytes(dst: &mut CounterQuad, src: &CounterQuad) {
+    dst.up_v4_bytes = dst.up_v4_bytes.saturating_add(src.up_v4_bytes);
+    dst.down_v4_bytes = dst.down_v4_bytes.saturating_add(src.down_v4_bytes);
+    dst.up_v6_bytes = dst.up_v6_bytes.saturating_add(src.up_v6_bytes);
+    dst.down_v6_bytes = dst.down_v6_bytes.saturating_add(src.down_v6_bytes);
 }
 
 /// 校验 --iface 和 TC 相关参数。

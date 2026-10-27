@@ -1,0 +1,36 @@
+name: core-ci
+
+on:
+  push:
+    branches:
+      - fix/persistence-memory
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        env:
+          AYA_BUILD_SKIP: "1"
+        run: cargo check -p bandix-plus --all-targets
+
+      - name: Test
+        env:
+          AYA_BUILD_SKIP: "1"
+        run: cargo test -p bandix-plus

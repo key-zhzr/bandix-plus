@@ -19,17 +19,7 @@ set_linker_env() {
   export "$var_name=$linker_path"
 }
 
-set_linker_env "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER" "x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc"
 set_linker_env "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER" "aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER" "arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-gcc"
-set_linker_env "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABI_LINKER" "arm-linux-musleabi-cross/bin/arm-linux-musleabi-gcc"
-set_linker_env "CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_MUSLEABI_LINKER" "arm-linux-musleabi-cross/bin/arm-linux-musleabi-gcc"
-set_linker_env "CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABI_LINKER" "arm-linux-musleabi-cross/bin/arm-linux-musleabi-gcc"
-set_linker_env "CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_LINKER" "arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-gcc"
-set_linker_env "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER" "riscv64-linux-musl-cross/bin/riscv64-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_POWERPC64LE_UNKNOWN_LINUX_MUSL_LINKER" "powerpc64le-linux-musl-cross/bin/powerpc64le-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER" "mips-linux-musl-cross/bin/mips-linux-musl-gcc"
-set_linker_env "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER" "mipsel-linux-musl-cross/bin/mipsel-linux-musl-gcc"
 
 # 定义版本号（从 Cargo.toml 获取或手动指定）
 VERSION=$(grep "^version" bandix-plus/Cargo.toml | cut -d '"' -f2)
@@ -42,30 +32,10 @@ mkdir -p $RELEASE_DIR
 
 # 构建目标平台列表
 DEFAULT_TARGETS=(
-  # x86_64 架构
-  "x86_64-unknown-linux-musl"
-  
-  # AArch64 (ARM64) 架构
   "aarch64-unknown-linux-musl"
-  
-  # ARM 32 位架构
-  "armv7-unknown-linux-musleabihf"
-  "armv7-unknown-linux-musleabi"
-  "armv5te-unknown-linux-musleabi"
-  "arm-unknown-linux-musleabi"
-  "arm-unknown-linux-musleabihf"
-  
-  # RISC-V 架构（新兴开源架构）
-  "riscv64gc-unknown-linux-musl"
-
-  # PowerPC 架构（部分高端路由器）
-  "powerpc64le-unknown-linux-musl"
 )
 
 MIPS_TARGETS=(
-  # MIPS 32 位架构（使用 nightly + build-std 构建）
-  "mips-unknown-linux-musl"
-  "mipsel-unknown-linux-musl"
 )
 
 print_linker_for_target() {

@@ -68,6 +68,14 @@ pub struct Options {
     )]
     pub traffic_retention_days: u32,
 
+    #[arg(
+        long = "bpf-map-max-entries",
+        default_value_t = 65536,
+        value_parser = clap::value_parser!(u32).range(1024..=65536),
+        help = "Capacity of each BPF traffic/limit map (1024..65536); changing it requires a service restart"
+    )]
+    pub bpf_map_max_entries: u32,
+
     #[arg(short, long, help = "Network interface to monitor (can specify multiple times)")]
     pub iface: Vec<String>,
 
@@ -129,7 +137,20 @@ pub struct Options {
 
 #[cfg(test)]
 mod tests {
-    use super::{TcBackend, TcOrder};
+    use super::{Options, TcBackend, TcOrder};
+    use clap::Parser;
+
+    #[test]
+    fn bpf_capacity_defaults_and_boundaries() {
+        assert_eq!(Options::try_parse_from(["bandix-plus"]).unwrap().bpf_map_max_entries, 65536);
+        for value in ["1024", "4096", "8192", "65536"] {
+            let options = Options::try_parse_from(["bandix-plus", "--bpf-map-max-entries", value]).unwrap();
+            assert_eq!(options.bpf_map_max_entries.to_string(), value);
+        }
+        for value in ["0", "1023", "65537", "4294967296", "-1", "invalid"] {
+            assert!(Options::try_parse_from(["bandix-plus", "--bpf-map-max-entries", value]).is_err());
+        }
+    }
 
     #[test]
     fn tc_order_parse_first() {
