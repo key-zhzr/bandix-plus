@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: key-zhzr/openwrt-bandix-plus
-          ref: 7c48c19bda3da19fe5649ad78fb37d0463b9d869
+          ref: eea746c3f30b5372a2c40428429c8850a7616054
           path: feed
           persist-credentials: false
       - uses: actions/checkout@v4
@@ -39,6 +39,7 @@ jobs:
           sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=file:///feed/artifacts|' feed/openwrt-bandix-plus/Makefile
           sed -i '/^PKG_VERSION:=/i CONFIG_LUCI_LANG_zh_Hans:=y' feed/luci-source/luci-app-bandix-plus/Makefile
           node --test feed/luci-source/tests/*.test.mjs
+          sh feed/tests/init-lifecycle.sh
           git -C feed rev-parse HEAD > package-source.txt
           git -C feed/luci-source rev-parse HEAD > luci-source.txt
           cp core-artifact/deployment/build-info.txt core-source.txt
@@ -61,6 +62,6 @@ jobs:
           (cd upload && sha256sum *.apk > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
-          name: bandix-0.1.7-luci-0.1.5-apk
+          name: bandix-0.1.7-r2-luci-0.1.5-apk
           path: upload/
           retention-days: 30
