@@ -2,6 +2,14 @@ name: router-validation
 on:
   push:
     branches: [codex/bandix-pagination-map-capacity-20261027]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - bandix-plus/**
+      - bandix-plus-common/**
+      - bandix-plus-ebpf/**
+      - build_release.sh
+      - install_dependencies.sh
   workflow_dispatch:
 permissions:
   contents: read

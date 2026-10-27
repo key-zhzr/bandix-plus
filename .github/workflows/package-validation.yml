@@ -1,0 +1,66 @@
+name: package-validation
+on:
+  push:
+    branches: [codex/bandix-pagination-map-capacity-20261027]
+    paths: [.github/workflows/package-validation.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: key-zhzr/openwrt-bandix-plus
+          ref: 7c48c19bda3da19fe5649ad78fb37d0463b9d869
+          path: feed
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: key-zhzr/luci-app-bandix-plus
+          ref: df68469abe6d1eac4b966f201d1ee3e2a015b58e
+          path: feed/luci-source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: bandix-plus-0.1.7-aarch64
+          run-id: 40372646772
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: core-artifact
+      - name: Prepare the pinned, tested core source archive
+        run: |
+          set -euo pipefail
+          mkdir -p feed/artifacts sdk-output
+          cp core-artifact/release/*.tar.gz feed/artifacts/
+          printf '%s  %s\n' 33fe5e713450cb4b5b493478c725a381e36fa2d7e7ae74f2262605932b631284 feed/artifacts/bandix-plus-0.1.7-aarch64-unknown-linux-musl.tar.gz | sha256sum -c -
+          sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=file:///feed/artifacts|' feed/openwrt-bandix-plus/Makefile
+          sed -i '/^PKG_VERSION:=/i CONFIG_LUCI_LANG_zh_Hans:=y' feed/luci-source/luci-app-bandix-plus/Makefile
+          node --test feed/luci-source/tests/*.test.mjs
+          git -C feed rev-parse HEAD > package-source.txt
+          git -C feed/luci-source rev-parse HEAD > luci-source.txt
+          cp core-artifact/deployment/build-info.txt core-source.txt
+      - name: Build APK packages using the OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: aarch64_cortex-a53
+          FEED_DIR: ${{ github.workspace }}/feed
+          ARTIFACTS_DIR: ${{ github.workspace }}/sdk-output
+          PACKAGES: openwrt-bandix-plus luci-app-bandix-plus
+          NO_SHFMT_CHECK: "1"
+          V: s
+      - name: Collect APKs and checksums
+        run: |
+          mkdir -p upload
+          find sdk-output/bin -type f -name '*bandix*.apk' -exec cp {} upload/ \;
+          test -n "$(find upload -type f -name 'bandix-plus-*.apk')"
+          test -n "$(find upload -type f -name 'luci-app-bandix-plus-*.apk')"
+          cp package-source.txt luci-source.txt core-source.txt upload/
+          (cd upload && sha256sum *.apk > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bandix-0.1.7-luci-0.1.5-apk
+          path: upload/
+          retention-days: 30
